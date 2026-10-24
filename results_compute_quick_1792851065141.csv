@@ -1,0 +1,20 @@
+CPU: Intel64 Family 6 Model 165 Stepping 2, GenuineIntel
+Java: 21.0.9
+Xmx: 4096MB
+Images: 48
+Mode,ThreadCount,RowsPerStrip,Rep,Round,Time_ms,GC_ms,Correct,Decode_ms,Compute_ms,Write_ms
+Sequential,1,64,0,0,14163.047,0.000,true,0.000,14163.047,0.000
+ParallelImage,1,64,0,0,13954.735,0.000,true,0.000,13954.735,0.000
+ParallelStrip,1,64,0,0,15014.794,0.000,true,0.000,15014.794,0.000
+Sequential,1,64,0,0,13894.969,0.000,true,0.000,13894.969,0.000
+ParallelImage,2,64,0,0,8127.485,0.000,true,0.000,8127.485,0.000
+ParallelStrip,2,64,0,0,8522.065,0.000,true,0.000,8522.065,0.000
+Sequential,1,64,0,0,14284.895,0.000,true,0.000,14284.895,0.000
+ParallelImage,4,64,0,0,4777.807,0.000,true,0.000,4777.807,0.000
+ParallelStrip,4,64,0,0,5366.405,0.000,true,0.000,5366.405,0.000
+Sequential,1,64,0,0,14070.855,0.000,true,0.000,14070.855,0.000
+ParallelImage,8,64,0,0,4023.016,0.000,true,0.000,4023.016,0.000
+ParallelStrip,8,64,0,0,4413.330,0.000,true,0.000,4413.330,0.000
+Sequential,1,64,0,0,14094.979,0.000,true,0.000,14094.979,0.000
+ParallelImage,16,64,0,0,3679.008,0.000,true,0.000,3679.008,0.000
+ParallelStrip,16,64,0,0,4173.594,0.000,true,0.000,4173.594,0.000

@@ -1,0 +1,12 @@
+E:\HomeWork_1\src\main\java\com\homework\processor\parallel\ParallelStripProcessor.java
+E:\HomeWork_1\src\main\java\com\homework\processor\core\Filter.java
+E:\HomeWork_1\src\main\java\com\homework\processor\ui\MainApp.java
+E:\HomeWork_1\src\main\java\com\homework\processor\benchmark\StatisticsCalculator.java
+E:\HomeWork_1\src\main\java\com\homework\processor\core\GaussianBlurFilter.java
+E:\HomeWork_1\src\main\java\com\homework\processor\sequential\SequentialProcessor.java
+E:\HomeWork_1\src\main\java\com\homework\processor\parallel\ParallelImageProcessor.java
+E:\HomeWork_1\src\main\java\com\homework\processor\benchmark\BenchmarkResult.java
+E:\HomeWork_1\src\main\java\com\homework\processor\benchmark\DatasetGenerator.java
+E:\HomeWork_1\src\main\java\com\homework\processor\core\SobelEdgeFilter.java
+E:\HomeWork_1\src\main\java\com\homework\processor\benchmark\BenchmarkHarness.java
+E:\HomeWork_1\src\main\java\com\homework\processor\core\ImageBuffer.java
