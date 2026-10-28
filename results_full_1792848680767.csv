@@ -1,5 +1,0 @@
-CPU: Intel64 Family 6 Model 165 Stepping 2, GenuineIntel
-Java: 21.0.9
-Xmx: 4096MB
-Images: 10
-Mode,ThreadCount,RowsPerStrip,Rep,Round,Time_ms,GC_ms,Correct,Decode_ms,Compute_ms,Write_ms

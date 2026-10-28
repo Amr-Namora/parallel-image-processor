@@ -14,7 +14,8 @@ A Batch Image Processor in Java 21 (Maven, IntelliJ). Pipeline: Gaussian Blur (3
 Grading: 30% thread safety and synchronization, 30% real speedup, 20% practical app with a UI that never freezes, 20% timing accuracy, graphs and report.
 
 ## Status
-- DONE and FROZEN: core filters, the three processors, 45+ tests (pixel-identical to sequential, shared-instance concurrency test), BenchmarkHarness (one JVM per mode, golden checksums, unique temp dirs, process guard, CSV with header). FULL_PIPELINED exists for ParallelImage only and was verified (50/50 correct runs, smoke test OK).
+- DONE and FROZEN: co
+- re filters, the three processors, 45+ tests (pixel-identical to sequential, shared-instance concurrency test), BenchmarkHarness (one JVM per mode, golden checksums, unique temp dirs, process guard, CSV with header). FULL_PIPELINED exists for ParallelImage only and was verified (50/50 correct runs, smoke test OK).
 - Do NOT change benchmark behavior. If the UI needs code that currently lives inside BenchmarkHarness, ask me first; any extraction must keep all tests green and the smoke test unchanged.
 - Old `results_*.csv` files from the concurrent-runs period are invalid and live in `old_invalid_results/`.
 
@@ -39,3 +40,6 @@ Windows 11, Java 21, IntelliJ Community. 4 physical / 8 logical cores (i5-10300H
 - No new features beyond what I ask. The project is already complex enough.
 - Correctness before speed. Never include a row with a failed correctness check in report data.
 - Concurrency rules: no mutable per-call state in shared processors or filters; one dedicated pool per run, created before the timer and shut down in `finally`; Semaphore always released in `finally`.
+
+## Open items
+- Before the final experiment: BenchmarkHarness strip mode still uses processFixed (a new ForkJoinPool per image). Decide with me whether to switch it to setPool+process (two call sites, then re-run tests and the smoke test) or to document it.
