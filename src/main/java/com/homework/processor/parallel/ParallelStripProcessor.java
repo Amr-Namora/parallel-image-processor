@@ -23,17 +23,24 @@ public class ParallelStripProcessor {
     private final int numThreads;
     private final int rowsPerStrip;
 
+    private ForkJoinPool pool;
+
     public ParallelStripProcessor(int numThreads, int rowsPerStrip) {
         this.numThreads = numThreads;
         this.rowsPerStrip = rowsPerStrip;
+    }
+
+    public void setPool(ForkJoinPool pool) {
+        this.pool = pool;
     }
 
     public ImageBuffer process(ImageBuffer input) {
         int width = input.getWidth();
         int height = input.getHeight();
 
-        // Create a dedicated pool for this specific run to control N strictly
-        ForkJoinPool pool = new ForkJoinPool(numThreads);
+        if (pool == null) {
+            throw new IllegalStateException("Pool must be set before processing");
+        }
         try {
             // Stage 1: Gaussian Blur
             ImageBuffer blurred = new ImageBuffer(width, height);
@@ -41,11 +48,7 @@ public class ParallelStripProcessor {
             executeStage(pool, blurFilter, input, blurred);
 
             // Stage 2: Grayscale conversion
-            // We use a specialized internal task for grayscale as it's not a Filter
             ImageBuffer gray = new ImageBuffer(width, height);
-            executeGrayscaleStage(pool, input, gray);
-            // Note: Per requirements, Sobel should use the blurred image's luminance.
-            // Correcting: Grayscale should be performed on the BLURRED image.
             executeGrayscaleStage(pool, blurred, gray);
 
             // Stage 3: Sobel Edge Detection
@@ -55,15 +58,7 @@ public class ParallelStripProcessor {
 
             return edges;
         } finally {
-            pool.shutdown();
-            try {
-                if (!pool.awaitTermination(10, TimeUnit.SECONDS)) {
-                    pool.shutdownNow();
-                }
-            } catch (InterruptedException e) {
-                pool.shutdownNow();
-                Thread.currentThread().interrupt();
-            }
+            // Pool is managed externally now
         }
     }
 
@@ -125,11 +120,25 @@ public class ParallelStripProcessor {
         }
     }
 
-    // Fixing the process method to use the parallel executors
     public ImageBuffer processFixed(ImageBuffer input) {
         int width = input.getWidth();
         int height = input.getHeight();
-        ForkJoinPool pool = new ForkJoinPool(numThreads);
+
+        if (pool == null) {
+            // Fallback for tests/legacy calls that don't use setPool
+            ForkJoinPool localPool = new ForkJoinPool(numThreads);
+            try {
+                return processWithPool(localPool, input);
+            } finally {
+                localPool.shutdown();
+            }
+        }
+        return processWithPool(pool, input);
+    }
+
+    private ImageBuffer processWithPool(ForkJoinPool pool, ImageBuffer input) {
+        int width = input.getWidth();
+        int height = input.getHeight();
         try {
             ImageBuffer blurred = new ImageBuffer(width, height);
             executeStageParallel(pool, new GaussianBlurFilter(), input, blurred);
@@ -142,15 +151,7 @@ public class ParallelStripProcessor {
 
             return edges;
         } finally {
-            pool.shutdown();
-            try {
-                if (!pool.awaitTermination(10, TimeUnit.SECONDS)) {
-                    pool.shutdownNow();
-                }
-            } catch (InterruptedException e) {
-                pool.shutdownNow();
-                Thread.currentThread().interrupt();
-            }
+            // pool shutdown managed by caller if provided via setPool
         }
     }
 }

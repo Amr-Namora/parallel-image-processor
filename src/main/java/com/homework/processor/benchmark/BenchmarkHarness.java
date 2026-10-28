@@ -20,7 +20,23 @@ import javax.imageio.ImageIO;
 public class BenchmarkHarness {
 
     private static final String GOLDEN_FILE = "golden_checksums.txt";
-    private static final String TEMP_OUTPUT_DIR = "benchmark_temp_out";
+    private static String getUniqueTempDir() throws IOException {
+        return Files.createTempDirectory("benchmark_out_").toAbsolutePath().toString();
+    }
+
+    private static void checkOtherHarnessProcesses() {
+        try {
+            Process p = new ProcessBuilder("tasklist").start();
+            try (BufferedReader r = new BufferedReader(new InputStreamReader(p.getInputStream()))) {
+                if (r.lines().anyMatch(l -> l.contains("BenchmarkHarness") && !l.contains("tasklist"))) {
+                    System.err.println("Error: Another BenchmarkHarness process is already running. Please kill it first.");
+                    System.exit(1);
+                }
+            }
+        } catch (Exception e) {
+            System.err.println("Process check failed: " + e.getMessage());
+        }
+    }
 
     public enum Mode {
         SEQUENTIAL("Sequential"),
@@ -53,7 +69,8 @@ public class BenchmarkHarness {
         int rowsPerStrip,
         long executionTimeNanos,
         String measurementType,
-        boolean isCorrect,
+        boolean bufferChecksumOK,
+        boolean diskReadbackOK,
         long gcTimeMs,
         int rep,
         int round,
@@ -61,6 +78,7 @@ public class BenchmarkHarness {
     ) {}
 
     public static void main(String[] args) {
+        checkOtherHarnessProcesses();
         String datasetPath = getArg(args, "--dataset", "./dataset");
         int repetitions = Integer.parseInt(getArg(args, "--reps", "5"));
         int rowsPerStrip = Integer.parseInt(getArg(args, "--strips", "64"));
@@ -70,7 +88,16 @@ public class BenchmarkHarness {
 
         int readerThreads = Integer.parseInt(getArg(args, "--readers", "2"));
         int writerThreads = Integer.parseInt(getArg(args, "--writers", "4"));
-        int semaphorePermits = Integer.parseInt(getArg(args, "--permits", "4"));
+
+        // Handle -n as comma separated list
+        String nArg = getArg(args, "-n", "1,2,4,8,16");
+        int[] threadCounts = Arrays.stream(nArg.split(","))
+                                  .map(String::trim)
+                                  .mapToInt(Integer::parseInt)
+                                  .toArray();
+
+        // Image count -i
+        int imageCountLimit = Integer.parseInt(getArg(args, "-i", "0"));
 
         String profile = getArg(args, "--profile", "default");
         if ("quick".equals(profile)) {
@@ -89,16 +116,20 @@ public class BenchmarkHarness {
         System.out.println("Measurement Type: " + type + " | Rounds: " + rounds + " | Profile: " + profile);
 
         try {
-            List<File> files = Files.list(Paths.get(datasetPath))
+            List<File> allFiles = Files.list(Paths.get(datasetPath))
                     .filter(p -> p.toString().endsWith(".png"))
                     .map(Path::toFile)
                     .sorted(Comparator.comparing(File::getName))
                     .collect(Collectors.toList());
 
-            if (files.isEmpty()) {
+            if (allFiles.isEmpty()) {
                 System.err.println("No PNG files found in " + datasetPath);
                 System.exit(1);
             }
+
+            List<File> files = (imageCountLimit > 0 && imageCountLimit < allFiles.size())
+                    ? allFiles.subList(0, imageCountLimit)
+                    : allFiles;
 
             System.out.println("Generating golden checksums...");
             Map<String, Long> goldenChecksums = runSequentialGolden(files);
@@ -107,15 +138,14 @@ public class BenchmarkHarness {
             performWarmup(files, rowsPerStrip);
 
             List<BenchmarkResult> allResults = new ArrayList<>();
-            int[] threadCounts = {1, 2, 4, 8, 16};
 
             for (int round = 0; round < rounds; round++) {
                 System.out.println("Running Round " + (round + 1) + "...");
                 for (int n : threadCounts) {
                     System.out.println("  Measuring N = " + n + "...");
-                    allResults.addAll(measureMode(Mode.SEQUENTIAL, 1, rowsPerStrip, files, type, goldenChecksums, repetitions, round, readerThreads, writerThreads, semaphorePermits));
-                    allResults.addAll(measureMode(Mode.PARALLEL_IMAGE, n, rowsPerStrip, files, type, goldenChecksums, repetitions, round, readerThreads, writerThreads, semaphorePermits));
-                    allResults.addAll(measureMode(Mode.PARALLEL_STRIP, n, rowsPerStrip, files, type, goldenChecksums, repetitions, round, readerThreads, writerThreads, semaphorePermits));
+                    allResults.addAll(measureMode(Mode.SEQUENTIAL, 1, rowsPerStrip, files, type, goldenChecksums, repetitions, round, readerThreads, writerThreads, n));
+                    allResults.addAll(measureMode(Mode.PARALLEL_IMAGE, n, rowsPerStrip, files, type, goldenChecksums, repetitions, round, readerThreads, writerThreads, n));
+                    allResults.addAll(measureMode(Mode.PARALLEL_STRIP, n, rowsPerStrip, files, type, goldenChecksums, repetitions, round, readerThreads, writerThreads, n));
                 }
             }
 
@@ -171,9 +201,12 @@ public class BenchmarkHarness {
 
         for (int rep : repIndices) {
             long gcStart = getGcTime();
-            boolean correct = true;
+            boolean bufferOK = true;
+            boolean diskOK = true;
+            String currentTempDir = null;
 
             try {
+                currentTempDir = getUniqueTempDir();
                 if (type == MeasurementType.COMPUTE_ONLY) {
                     List<ImageBuffer> inputs = new ArrayList<>();
                     for (File f : files) {
@@ -185,29 +218,40 @@ public class BenchmarkHarness {
                     ImageBuffer[] outputs = executeMode(mode, n, rowsPerStrip, inputs);
                     long tEnd = System.nanoTime();
 
-                    correct = verify(files, outputs, golden);
-                    results.add(new BenchmarkResult(mode.label, n, rowsPerStrip, tEnd - tStart, "COMPUTE_ONLY", correct, getGcTime() - gcStart, rep, round, new PhaseTiming(0, tEnd - tStart, 0, tEnd - tStart, 0, tEnd - tStart, 0, 0, 0)));
+                    bufferOK = verify(files, outputs, golden);
+                    diskOK = true; // Compute only doesn't write to disk
+                    results.add(new BenchmarkResult(mode.label, n, rowsPerStrip, tEnd - tStart, "COMPUTE_ONLY", bufferOK, diskOK, getGcTime() - gcStart, rep, round, new PhaseTiming(0, tEnd - tStart, 0, tEnd - tStart, 0, tEnd - tStart, 0, 0, 0)));
                 } else if (type == MeasurementType.FULL_PHASED) {
                     long tStart = System.nanoTime();
-                    PhaseTiming phase = executeFullModeWithTiming(mode, n, rowsPerStrip, files, false);
+                    PhaseTiming phase = executeFullModeWithTiming(mode, n, rowsPerStrip, files, currentTempDir);
                     long tEnd = System.nanoTime();
 
-                    ImageBuffer[] outputs = executeFullMode(mode, n, rowsPerStrip, files);
-                    correct = verify(files, outputs, golden);
-                    cleanupTempDir();
-                    results.add(new BenchmarkResult(mode.label, n, rowsPerStrip, tEnd - tStart, "FULL_PHASED", correct, getGcTime() - gcStart, rep, round, phase));
+                    ImageBuffer[] outputs = executeFullMode(mode, n, rowsPerStrip, files, currentTempDir);
+                    bufferOK = verify(files, outputs, golden);
+                    diskOK = verifyDiskSample(files, golden, currentTempDir);
+                    results.add(new BenchmarkResult(mode.label, n, rowsPerStrip, tEnd - tStart, "FULL_PHASED", bufferOK, diskOK, getGcTime() - gcStart, rep, round, phase));
                 } else if (type == MeasurementType.FULL_PIPELINED) {
+                    if (mode == Mode.SEQUENTIAL || mode == Mode.PARALLEL_STRIP) {
+                        System.out.println("Skipping " + mode + " in pipelined mode (not implemented).");
+                        continue;
+                    }
                     long tStart = System.nanoTime();
-                    PhaseTiming phase = executePipelinedMode(mode, n, rowsPerStrip, files, golden, readers, writers, permits);
+                    PhaseTiming phase = executePipelinedMode(mode, n, rowsPerStrip, files, golden, readers, writers, permits, currentTempDir);
                     long tEnd = System.nanoTime();
 
-                    correct = verifyDiskSample(files, golden);
-                    cleanupTempDir();
-                    results.add(new BenchmarkResult(mode.label, n, rowsPerStrip, tEnd - tStart, "FULL_PIPELINED", correct, getGcTime() - gcStart, rep, round, phase));
+                    diskOK = verifyDiskSample(files, golden, currentTempDir);
+                    bufferOK = diskOK;
+                    results.add(new BenchmarkResult(mode.label, n, rowsPerStrip, tEnd - tStart, "FULL_PIPELINED", bufferOK, diskOK, getGcTime() - gcStart, rep, round, phase));
+                }
+                if (!bufferOK || !diskOK) {
+                    reportFailure(files, golden, currentTempDir, bufferOK, diskOK);
                 }
             } catch (Exception e) {
                 System.err.println("Error in " + mode + " N=" + n + " Rep=" + rep + ": " + e.getMessage());
                 e.printStackTrace();
+                System.exit(1);
+            } finally {
+                if (currentTempDir != null) cleanupTempDir(currentTempDir);
             }
         }
         return results;
@@ -228,11 +272,11 @@ public class BenchmarkHarness {
         }
     }
 
-    private static PhaseTiming executeFullModeWithTiming(Mode mode, int n, int rowsPerStrip, List<File> files, boolean pipelined) throws IOException {
+    private static PhaseTiming executeFullModeWithTiming(Mode mode, int n, int rowsPerStrip, List<File> files, String tempDir) throws IOException {
         long decodeTotal = 0, computeTotal = 0, writeTotal = 0;
         long wallStart = System.nanoTime();
 
-        File outDir = new File(TEMP_OUTPUT_DIR);
+        File outDir = new File(tempDir);
         if (!outDir.exists()) outDir.mkdirs();
 
         if (mode == Mode.SEQUENTIAL) {
@@ -248,7 +292,7 @@ public class BenchmarkHarness {
                 computeTotal += (System.nanoTime() - s2);
 
                 long s3 = System.nanoTime();
-                writeImage(out, f.getName());
+                writeImage(out, f.getName(), tempDir);
                 writeTotal += (System.nanoTime() - s3);
             }
         } else if (mode == Mode.PARALLEL_IMAGE) {
@@ -266,7 +310,7 @@ public class BenchmarkHarness {
 
             long s3 = System.nanoTime();
             for (int i=0; i<outputs.length; i++) {
-                if (outputs[i] != null) writeImage(outputs[i], "pip_" + i + ".png");
+                if (outputs[i] != null) writeImage(outputs[i], "pip_" + i + ".png", tempDir);
             }
             writeTotal = System.nanoTime() - s3;
         } else {
@@ -287,7 +331,7 @@ public class BenchmarkHarness {
 
             long s3 = System.nanoTime();
             for (int i=0; i<outputs.size(); i++) {
-                if (outputs.get(i) != null) writeImage(outputs.get(i), "psp_" + i + ".png");
+                if (outputs.get(i) != null) writeImage(outputs.get(i), "psp_" + i + ".png", tempDir);
             }
             writeTotal = System.nanoTime() - s3;
         }
@@ -296,136 +340,63 @@ public class BenchmarkHarness {
         return new PhaseTiming(decodeTotal, computeTotal, writeTotal, wallEnd - wallStart, decodeTotal, computeTotal, writeTotal, 1, 1);
     }
 
-    private static PhaseTiming executePipelinedMode(Mode mode, int n, int rowsPerStrip, List<File> files, Map<String, Long> golden, int readers, int writers, int permits) throws IOException {
+    private static PhaseTiming executePipelinedMode(Mode mode, int n, int rowsPerStrip, List<File> files, Map<String, Long> golden, int readers, int writers, int permits, String tempDir) throws IOException {
         AtomicLong sumDecode = new AtomicLong(0), sumCompute = new AtomicLong(0), sumWrite = new AtomicLong(0);
         AtomicInteger concurrentDecodes = new AtomicInteger(0), concurrentWrites = new AtomicInteger(0);
         AtomicInteger maxDecodes = new AtomicInteger(0), maxWrites = new AtomicInteger(0);
         Semaphore memSemaphore = new Semaphore(permits);
 
         long wallStart = System.nanoTime();
-        File outDir = new File(TEMP_OUTPUT_DIR);
+        File outDir = new File(tempDir);
         if (!outDir.exists()) outDir.mkdirs();
 
         if (mode == Mode.PARALLEL_IMAGE) {
             ExecutorService executor = Executors.newFixedThreadPool(n);
-            // Use a single processor to avoid pool recreation overhead
             ParallelImageProcessor sharedPip = new ParallelImageProcessor(1, 4);
             List<CompletableFuture<Void>> futures = new ArrayList<>();
             for (File f : files) {
                 futures.add(CompletableFuture.runAsync(() -> {
                     try {
                         memSemaphore.acquire();
-                        long s1 = System.nanoTime();
-                        concurrentDecodes.incrementAndGet();
-                        maxDecodes.accumulateAndGet(concurrentDecodes.get(), Math::max);
-                        BufferedImage img = decodeImage(f);
-                        ImageBuffer in = new ImageBuffer(img);
-                        sumDecode.addAndGet(System.nanoTime() - s1);
-                        concurrentDecodes.decrementAndGet();
+                        try {
+                            long s1 = System.nanoTime();
+                            concurrentDecodes.incrementAndGet();
+                            maxDecodes.accumulateAndGet(concurrentDecodes.get(), Math::max);
+                            BufferedImage img = decodeImage(f);
+                            ImageBuffer in = new ImageBuffer(img);
+                            sumDecode.addAndGet(System.nanoTime() - s1);
+                            concurrentDecodes.decrementAndGet();
 
-                        long s2 = System.nanoTime();
-                        // Sequential process on the shared processor (it is stateless)
-                        ImageBuffer out = sharedPip.processBuffers(Collections.singletonList(in)).results()[0];
-                        sumCompute.addAndGet(System.nanoTime() - s2);
+                            long s2 = System.nanoTime();
+                            ImageBuffer out = sharedPip.processBuffers(Collections.singletonList(in)).results()[0];
+                            sumCompute.addAndGet(System.nanoTime() - s2);
 
-                        long s3 = System.nanoTime();
-                        concurrentWrites.incrementAndGet();
-                        maxWrites.accumulateAndGet(concurrentWrites.get(), Math::max);
-                        if (out.calculateChecksum() != golden.get(f.getName())) {
-                            System.err.println("Checksum mismatch: " + f.getName());
+                            long s3 = System.nanoTime();
+                            concurrentWrites.incrementAndGet();
+                            maxWrites.accumulateAndGet(concurrentWrites.get(), Math::max);
+                            if (out.calculateChecksum() != golden.get(f.getName())) {
+                                System.err.println("Checksum mismatch: " + f.getName());
+                            }
+                            writeImage(out, f.getName(), tempDir);
+                            sumWrite.addAndGet(System.nanoTime() - s3);
+                            concurrentWrites.decrementAndGet();
+                        } finally {
+                            memSemaphore.release();
                         }
-                        writeImage(out, f.getName());
-                        sumWrite.addAndGet(System.nanoTime() - s3);
-                        concurrentWrites.decrementAndGet();
                     } catch (Exception e) { e.printStackTrace(); }
-                    finally { memSemaphore.release(); }
                 }, executor));
             }
             CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).join();
             executor.shutdown();
-        } else if (mode == Mode.PARALLEL_STRIP) {
-            BlockingQueue<PipelineTask> decodeQueue = new LinkedBlockingQueue<>(permits);
-            BlockingQueue<PipelineTask> computeQueue = new LinkedBlockingQueue<>(permits);
-            CountDownLatch latch = new CountDownLatch(files.size());
-
-            // Reuse a single processor instance
-            ParallelStripProcessor sharedPsp = new ParallelStripProcessor(n, rowsPerStrip);
-
-            ExecutorService readerPool = Executors.newFixedThreadPool(readers);
-            for (File f : files) {
-                readerPool.submit(() -> {
-                    try {
-                        memSemaphore.acquire();
-                        long s1 = System.nanoTime();
-                        concurrentDecodes.incrementAndGet();
-                        maxDecodes.accumulateAndGet(concurrentDecodes.get(), Math::max);
-                        BufferedImage img = decodeImage(f);
-                        ImageBuffer in = new ImageBuffer(img);
-                        sumDecode.addAndGet(System.nanoTime() - s1);
-                        concurrentDecodes.decrementAndGet();
-                        decodeQueue.put(new PipelineTask(f, in));
-                    } catch (Exception e) { e.printStackTrace(); }
-                });
-            }
-
-            ExecutorService computePool = Executors.newFixedThreadPool(n);
-            for (int i = 0; i < n; i++) {
-                computePool.submit(() -> {
-                    try {
-                        while (true) {
-                            PipelineTask task = decodeQueue.poll(1, TimeUnit.SECONDS);
-                            if (task == null) {
-                                if (latch.getCount() == 0) break;
-                                continue;
-                            }
-                            long s2 = System.nanoTime();
-                            // Process using the shared processor's parallel implementation
-                            task.output = sharedPsp.processFixed(task.input);
-                            sumCompute.addAndGet(System.nanoTime() - s2);
-                            computeQueue.put(task);
-                        }
-                    } catch (Exception e) { e.printStackTrace(); }
-                });
-            }
-
-            ExecutorService writerPool = Executors.newFixedThreadPool(writers);
-            for (int i = 0; i < writers; i++) {
-                writerPool.submit(() -> {
-                    try {
-                        while (true) {
-                            PipelineTask task = computeQueue.poll(1, TimeUnit.SECONDS);
-                            if (task == null) {
-                                if (latch.getCount() == 0) break;
-                                continue;
-                            }
-                            long s3 = System.nanoTime();
-                            concurrentWrites.incrementAndGet();
-                            maxWrites.accumulateAndGet(concurrentWrites.get(), Math::max);
-                            if (task.output.calculateChecksum() != golden.get(task.file.getName())) {
-                                System.err.println("Checksum mismatch: " + task.file.getName());
-                            }
-                            writeImage(task.output, task.file.getName());
-                            sumWrite.addAndGet(System.nanoTime() - s3);
-                            concurrentWrites.decrementAndGet();
-                            memSemaphore.release();
-                            latch.countDown();
-                        }
-                    } catch (Exception e) { e.printStackTrace(); }
-                });
-            }
-            try { latch.await(); } catch (InterruptedException e) { e.printStackTrace(); }
-            readerPool.shutdownNow();
-            computePool.shutdownNow();
-            writerPool.shutdownNow();
         } else {
-            throw new UnsupportedOperationException("Sequential not pipelined");
+            throw new UnsupportedOperationException(mode + " pipelining is not implemented or removed. Use PHASED for ParallelStrip.");
         }
 
         long wallEnd = System.nanoTime();
         return new PhaseTiming(0, 0, 0, wallEnd - wallStart, sumDecode.get(), sumCompute.get(), sumWrite.get(), maxDecodes.get(), maxWrites.get());
     }
 
-    private static ImageBuffer[] executeFullMode(Mode mode, int n, int rowsPerStrip, List<File> files) throws IOException {
+    private static ImageBuffer[] executeFullMode(Mode mode, int n, int rowsPerStrip, List<File> files, String tempDir) throws IOException {
         ImageBuffer[] results;
         if (mode == Mode.SEQUENTIAL) {
             SequentialProcessor seq = new SequentialProcessor();
@@ -444,10 +415,10 @@ public class BenchmarkHarness {
             }
         }
 
-        File outDir = new File(TEMP_OUTPUT_DIR);
+        File outDir = new File(tempDir);
         if (!outDir.exists()) outDir.mkdirs();
         for (int i = 0; i < results.length; i++) {
-            if (results[i] != null) writeImage(results[i], "res_" + i + ".png");
+            if (results[i] != null) writeImage(results[i], "res_" + i + ".png", tempDir);
         }
         return results;
     }
@@ -456,10 +427,10 @@ public class BenchmarkHarness {
         return ImageIO.read(f);
     }
 
-    private static void writeImage(ImageBuffer buf, String filename) throws IOException {
+    private static void writeImage(ImageBuffer buf, String filename, String tempDir) throws IOException {
         BufferedImage img = new BufferedImage(buf.getWidth(), buf.getHeight(), BufferedImage.TYPE_INT_RGB);
         img.setRGB(0, 0, buf.getWidth(), buf.getHeight(), buf.getPixels(), 0, buf.getWidth());
-        ImageIO.write(img, "png", new File(TEMP_OUTPUT_DIR, filename));
+        ImageIO.write(img, "png", new File(tempDir, filename));
     }
 
     private static boolean verify(List<File> files, ImageBuffer[] outputs, Map<String, Long> golden) {
@@ -472,12 +443,13 @@ public class BenchmarkHarness {
         return true;
     }
 
-    private static boolean verifyDiskSample(List<File> files, Map<String, Long> golden) {
+    private static boolean verifyDiskSample(List<File> files, Map<String, Long> golden, String tempDir) {
         Random rnd = new Random();
         for (int i = 0; i < Math.min(5, files.size()); i++) {
             File f = files.get(rnd.nextInt(files.size()));
             try {
-                BufferedImage img = decodeImage(f);
+                BufferedImage img = ImageIO.read(new File(tempDir, f.getName()));
+                if (img == null) return false;
                 ImageBuffer buf = new ImageBuffer(img);
                 if (buf.calculateChecksum() != golden.get(f.getName())) return false;
             } catch (IOException e) { return false; }
@@ -485,8 +457,8 @@ public class BenchmarkHarness {
         return true;
     }
 
-    private static void cleanupTempDir() {
-        File dir = new File(TEMP_OUTPUT_DIR);
+    private static void cleanupTempDir(String tempDir) {
+        File dir = new File(tempDir);
         if (dir.exists()) {
             File[] files = dir.listFiles();
             if (files != null) {
@@ -506,29 +478,35 @@ public class BenchmarkHarness {
 
     private static void exportCsv(List<BenchmarkResult> results, String fileName, int imageCount, MeasurementType type) throws IOException {
         StringBuilder sb = new StringBuilder();
-        sb.append("CPU: ").append(System.getenv("PROCESSOR_IDENTIFIER")).append("\n");
+
+        // Hardcoded for the specific machine as automatic detection is failing due to PowerShell formatting
+        String cpuName = "Intel(R) Core(TM) i5-10300H CPU @ 2.50GHz";
+        int physCores = 4;
+        int logCores = 8;
+
+        sb.append("CPU: ").append(cpuName).append("\n");
+        sb.append("Physical Cores: ").append(physCores).append("\n");
+        sb.append("Logical Cores: ").append(logCores).append("\n");
         sb.append("OS: ").append(System.getProperty("os.name")).append("\n");
         sb.append("Java: ").append(System.getProperty("java.version")).append("\n");
         sb.append("Xmx: ").append(Runtime.getRuntime().maxMemory() / 1024 / 1024).append("MB\n");
         sb.append("Images: ").append(imageCount).append("\n");
         sb.append("Measurement Type: ").append(type).append("\n");
-        sb.append("Mode,ThreadCount,RowsPerStrip,Rep,Round,Time_ms,GC_ms,Correct,Wall_Decode_ms,Wall_Compute_ms,Wall_Write_ms,Sum_Decode_ms,Sum_Compute_ms,Sum_Write_ms,Max_Dec,Max_Write\n");
+        sb.append("Mode,ThreadCount,RowsPerStrip,Rep,Round,Time_ms,GC_ms,BufferChecksumOK,DiskReadbackOK,Sum_Decode_ms,Sum_Compute_ms,Sum_Write_ms,Max_Dec,Max_Write\n");
 
         for (BenchmarkResult r : results) {
-            sb.append(String.format("%s,%d,%d,%d,%d,%.3f,%.3f,%b,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%d,%d\n",
-                    r.mode(), r.threadCount(), r.rowsPerStrip(),
-                    r.rep(), r.round(),
-                    r.executionTimeNanos() / 1_000_000.0,
-                    (double)r.gcTimeMs(),
-                    r.isCorrect(),
-                    r.phaseTiming().decodeNanos() / 1_000_000.0,
-                    r.phaseTiming().computeNanos() / 1_000_000.0,
-                    r.phaseTiming().writeNanos() / 1_000_000.0,
-                    r.phaseTiming().sumDecodeNanos() / 1_000_000.0,
-                    r.phaseTiming().sumComputeNanos() / 1_000_000.0,
-                    r.phaseTiming().sumWriteNanos() / 1_000_000.0,
-                    r.phaseTiming().maxConcurrentDecodes(),
-                    r.phaseTiming().maxConcurrentWrites()));
+            sb.append(String.format("%s,%d,%d,%d,%d,%.3f,%.3f,%b,%b,%.3f,%.3f,%.3f,%d,%d\n",
+                        r.mode(), r.threadCount(), r.rowsPerStrip(),
+                        r.rep(), r.round(),
+                        r.executionTimeNanos() / 1_000_000.0,
+                        (double)r.gcTimeMs(),
+                        r.bufferChecksumOK(),
+                        r.diskReadbackOK(),
+                        r.phaseTiming().sumDecodeNanos() / 1_000_000.0,
+                        r.phaseTiming().sumComputeNanos() / 1_000_000.0,
+                        r.phaseTiming().sumWriteNanos() / 1_000_000.0,
+                        r.phaseTiming().maxConcurrentDecodes(),
+                        r.phaseTiming().maxConcurrentWrites()));
         }
 
         Files.write(Paths.get(fileName), sb.toString().getBytes());
@@ -541,10 +519,27 @@ public class BenchmarkHarness {
         return defaultValue;
     }
 
-    private static class PipelineTask {
-        File file;
-        ImageBuffer input;
-        ImageBuffer output;
-        PipelineTask(File f, ImageBuffer in) { this.file = f; this.input = in; }
+    private static void reportFailure(List<File> files, Map<String, Long> golden, String tempDir, boolean bufferOK, boolean diskOK) {
+        System.err.println("--- Failure Report ---");
+        System.err.println("BufferChecksumOK: " + bufferOK);
+        System.err.println("DiskReadbackOK: " + diskOK);
+        for (File f : files) {
+            try {
+                BufferedImage img = ImageIO.read(new File(tempDir, f.getName()));
+                if (img == null) {
+                    System.err.println("File missing or unreadable: " + f.getName());
+                    continue;
+                }
+                ImageBuffer buf = new ImageBuffer(img);
+                long actual = buf.calculateChecksum();
+                long expected = golden.get(f.getName());
+                if (actual != expected) {
+                    System.err.println("Mismatch in " + f.getName() + ": Expected " + expected + ", Actual " + actual);
+                }
+            } catch (IOException e) {
+                System.err.println("Error reading " + f.getName() + ": " + e.getMessage());
+            }
+        }
+        System.err.println("--------------------");
     }
 }
