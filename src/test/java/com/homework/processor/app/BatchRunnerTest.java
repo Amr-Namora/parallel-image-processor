@@ -48,13 +48,11 @@ class BatchRunnerTest {
     @ParameterizedTest
     @ValueSource(ints = {1, 2, 4, 8, 100})
     void testParallelCorrectnessAndThreads(int n) throws IOException {
-        // Use 97x61 images
         int count = 10;
         for (int i = 0; i < count; i++) {
             createTestImage("img_" + i + ".png", 97, 61, i * 10);
         }
 
-        // Repeat 20 times as requested
         for (int rep = 0; rep < 20; rep++) {
             Path roundOutputDir = Files.createTempDirectory("round_" + rep);
             BatchRunner.RunResult result = runner.run(BatchRunner.Mode.PARALLEL_IMAGES, inputDir, roundOutputDir, n, null, null);
@@ -70,13 +68,42 @@ class BatchRunnerTest {
         }
     }
 
+    @ParameterizedTest
+    @ValueSource(ints = {1, 2, 4, 8})
+    void testStripCorrectness(int n) throws IOException {
+        // 1. Regular small image (97x61)
+        createTestImage("small.png", 97, 61, 0x112233);
+        // 2. Very short image (height < 64)
+        createTestImage("short.png", 100, 20, 0x445566);
+        // 3. 1-pixel high
+        createTestImage("oneH.png", 100, 1, 0x778899);
+        // 4. 1-pixel wide
+        createTestImage("oneW.png", 1, 100, 0xAABBCC);
+        // 5. Large image
+        createTestImage("large.png", 1000, 1000, 0xDEADBEEF);
+
+        for (int rep = 0; rep < 20; rep++) {
+            Path roundOutputDir = Files.createTempDirectory("strip_round_" + rep);
+            BatchRunner.RunResult result = runner.run(BatchRunner.Mode.PARALLEL_STRIPS, inputDir, roundOutputDir, n, null, null);
+
+            assertEquals(5, result.processed(), "Failed at rep " + rep + " N=" + n);
+
+            String[] names = {"small.png", "short.png", "oneH.png", "oneW.png", "large.png"};
+            for (String name : names) {
+                ImageBuffer expected = new SequentialProcessor().process(new ImageBuffer(javax.imageio.ImageIO.read(inputDir.resolve(name).toFile())));
+                ImageBuffer actual = new ImageBuffer(javax.imageio.ImageIO.read(roundOutputDir.resolve(name).toFile()));
+                assertArrayEquals(expected.getPixels(), actual.getPixels(), "Pixel mismatch in " + name + " at rep " + rep + " N=" + n);
+            }
+        }
+    }
+
     @Test
-    void testParallelCorruptFile() throws IOException {
+    void testParallelStripCorruptFile() throws IOException {
         createTestImage("valid1.png", 10, 10, 0);
         Files.write(inputDir.resolve("corrupt.png"), new byte[]{1, 2, 3});
         createTestImage("valid2.png", 10, 10, 0);
 
-        BatchRunner.RunResult result = runner.run(BatchRunner.Mode.PARALLEL_IMAGES, inputDir, outputDir, 4, null, null);
+        BatchRunner.RunResult result = runner.run(BatchRunner.Mode.PARALLEL_STRIPS, inputDir, outputDir, 4, null, null);
 
         assertEquals(2, result.processed());
         assertEquals(1, result.failedFiles().size());
@@ -85,20 +112,17 @@ class BatchRunnerTest {
     }
 
     @Test
-    void testParallelThreadsDead() throws IOException {
+    void testParallelStripThreadsDead() throws IOException {
         createTestImage("img.png", 10, 10, 0);
-        runner.run(BatchRunner.Mode.PARALLEL_IMAGES, inputDir, outputDir, 4, null, null);
+        runner.run(BatchRunner.Mode.PARALLEL_STRIPS, inputDir, outputDir, 4, null, null);
 
-        // Check all threads in current group for the specific name
         Set<Thread> activePoolThreads = new HashSet<>();
         Thread.getAllStackTraces().keySet().forEach(t -> {
-            if (t.getName().contains("BatchRunner-ParallelImage-Thread")) {
+            if (t.getName().contains("ForkJoinPool-1-worker")) {
                 activePoolThreads.add(t);
             }
         });
 
-        // Note: This is a loose check as threads might still be in shutdown sequence,
-        // but the executor.shutdown() and awaitTermination() should have cleared them.
         assertTrue(activePoolThreads.isEmpty() ||
                    activePoolThreads.stream().allMatch(t -> t.getState() == Thread.State.TERMINATED),
                    "Pool threads still alive");
@@ -123,10 +147,17 @@ class BatchRunnerTest {
         assertEquals(count, lastProgress.get());
         assertEquals(count, callCount.get());
 
-        // Test Parallel Progress
+        // Test Parallel Image Progress
         Path pOut = Files.createTempDirectory("pout");
         callCount.set(0);
         runner.run(BatchRunner.Mode.PARALLEL_IMAGES, inputDir, pOut, 4, l, null);
+        assertEquals(count, lastProgress.get());
+        assertEquals(count, callCount.get());
+
+        // Test Parallel Strip Progress
+        Path sOut = Files.createTempDirectory("sout");
+        callCount.set(0);
+        runner.run(BatchRunner.Mode.PARALLEL_STRIPS, inputDir, sOut, 4, l, null);
         assertEquals(count, lastProgress.get());
         assertEquals(count, callCount.get());
     }

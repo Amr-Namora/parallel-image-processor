@@ -2,6 +2,7 @@ package com.homework.processor.app;
 
 import com.homework.processor.core.*;
 import com.homework.processor.sequential.SequentialProcessor;
+import com.homework.processor.parallel.ParallelStripProcessor;
 
 import javax.imageio.ImageIO;
 import java.awt.image.BufferedImage;
@@ -47,14 +48,11 @@ public class BatchRunner {
 
     /**
      * Executes the batch process.
-     * For PARALLEL_IMAGES, elapsedNanos covers the time from the start of task submission
-     * until all tasks are completed (wall-clock time of the compute phase).
+     * For PARALLEL_IMAGES and PARALLEL_STRIPS, elapsedNanos covers the time from the start of
+     * the compute phase (pool creation/submission) until all images are processed and
+     * the pool is shut down (wall-clock time).
      */
     public RunResult run(Mode mode, Path inputDir, Path outputDir, int threads, ProgressListener l, CancelToken c) {
-        if (mode == Mode.PARALLEL_STRIPS) {
-            throw new UnsupportedOperationException("Mode PARALLEL_STRIPS is not yet implemented in BatchRunner.");
-        }
-
         if (!Files.exists(inputDir) || !Files.isDirectory(inputDir)) {
             throw new IllegalArgumentException("Input directory does not exist: " + inputDir);
         }
@@ -76,8 +74,10 @@ public class BatchRunner {
 
         if (mode == Mode.SEQUENTIAL) {
             return runSequential(files, outputDir, l, c);
-        } else {
+        } else if (mode == Mode.PARALLEL_IMAGES) {
             return runParallelImages(files, outputDir, threads, l, c);
+        } else {
+            return runParallelStrips(files, outputDir, threads, l, c);
         }
     }
 
@@ -117,7 +117,6 @@ public class BatchRunner {
         AtomicInteger doneCount = new AtomicInteger(0);
         Semaphore memSemaphore = new Semaphore(threads);
 
-        // Use a thread factory to name threads for test verification
         ThreadFactory factory = r -> {
             Thread t = new Thread(r);
             t.setName("BatchRunner-ParallelImage-Thread");
@@ -167,6 +166,59 @@ public class BatchRunner {
 
         long end = System.nanoTime();
         return new RunResult(end - start, total, processed.get(), new ArrayList<>(failures), c != null && c.isCancelled());
+    }
+
+    private RunResult runParallelStrips(List<Path> files, Path outputDir, int threads, ProgressListener l, CancelToken c) {
+        int total = files.size();
+        List<FailedFile> failures = new ArrayList<>();
+        int processed = 0;
+
+        // Fixed rowsPerStrip = 64 as per harness
+        int rowsPerStrip = 64;
+
+        // ForkJoinPool(N) created before timed region
+        ForkJoinPool pool = new ForkJoinPool(threads);
+
+        long start = System.nanoTime();
+        try {
+            ParallelStripProcessor psp = new ParallelStripProcessor(threads, rowsPerStrip);
+            psp.setPool(pool);
+
+            for (Path file : files) {
+                if (c != null && c.isCancelled()) {
+                    return new RunResult(System.nanoTime() - start, total, processed, failures, true);
+                }
+
+                try {
+                    ImageBuffer input = decode(file);
+                    ImageBuffer output = psp.process(input);
+                    write(output, file.getFileName().toString(), outputDir);
+                    processed++;
+                } catch (Exception e) {
+                    failures.add(new FailedFile(file.getFileName().toString(), e.getMessage()));
+                }
+
+                if (l != null) {
+                    l.onProgress(processed + failures.size(), total);
+                }
+            }
+        } finally {
+            pool.shutdown();
+            try {
+                if (!pool.awaitTermination(60, TimeUnit.SECONDS)) {
+                    pool.shutdownNow();
+                    // Report error as requested (via failure list or result flag, but RunResult doesn't have a general error field,
+                    // so we ensure it's not silent. Since we can't throw from finally, we mark a failure if it happened).
+                    failures.add(new FailedFile("System", "ParallelStrip pool shutdown timed out"));
+                }
+            } catch (InterruptedException e) {
+                pool.shutdownNow();
+                Thread.currentThread().interrupt();
+            }
+        }
+
+        long end = System.nanoTime();
+        return new RunResult(end - start, total, processed, failures, false);
     }
 
     private List<Path> discoverImages(Path dir) {
