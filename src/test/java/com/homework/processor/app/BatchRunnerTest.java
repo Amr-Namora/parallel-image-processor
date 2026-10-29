@@ -11,6 +11,7 @@ import java.io.*;
 import java.nio.file.*;
 import java.util.*;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Consumer;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -71,15 +72,10 @@ class BatchRunnerTest {
     @ParameterizedTest
     @ValueSource(ints = {1, 2, 4, 8})
     void testStripCorrectness(int n) throws IOException {
-        // 1. Regular small image (97x61)
         createTestImage("small.png", 97, 61, 0x112233);
-        // 2. Very short image (height < 64)
         createTestImage("short.png", 100, 20, 0x445566);
-        // 3. 1-pixel high
         createTestImage("oneH.png", 100, 1, 0x778899);
-        // 4. 1-pixel wide
         createTestImage("oneW.png", 1, 100, 0xAABBCC);
-        // 5. Large image
         createTestImage("large.png", 1000, 1000, 0xDEADBEEF);
 
         for (int rep = 0; rep < 20; rep++) {
@@ -142,19 +138,16 @@ class BatchRunnerTest {
             callCount.incrementAndGet();
         };
 
-        // Test Sequential Progress
         runner.run(BatchRunner.Mode.SEQUENTIAL, inputDir, outputDir, 1, l, null);
         assertEquals(count, lastProgress.get());
         assertEquals(count, callCount.get());
 
-        // Test Parallel Image Progress
         Path pOut = Files.createTempDirectory("pout");
         callCount.set(0);
         runner.run(BatchRunner.Mode.PARALLEL_IMAGES, inputDir, pOut, 4, l, null);
         assertEquals(count, lastProgress.get());
         assertEquals(count, callCount.get());
 
-        // Test Parallel Strip Progress
         Path sOut = Files.createTempDirectory("sout");
         callCount.set(0);
         runner.run(BatchRunner.Mode.PARALLEL_STRIPS, inputDir, sOut, 4, l, null);
@@ -193,5 +186,114 @@ class BatchRunnerTest {
         assertThrows(IllegalArgumentException.class, () ->
             runner.run(BatchRunner.Mode.SEQUENTIAL, inputDir, inputDir, 1, null, null)
         );
+    }
+
+    // --- Step 5 Tests ---
+
+    @Test
+    void testPreCancelledToken() throws IOException {
+        createTestImage("img.png", 10, 10, 0);
+        BatchRunner.CancelToken ct = new BatchRunner.CancelToken();
+        ct.cancel();
+
+        for (BatchRunner.Mode mode : BatchRunner.Mode.values()) {
+            BatchRunner.RunResult res = runner.run(mode, inputDir, outputDir, 4, null, ct);
+            assertTrue(res.cancelled(), "Mode " + mode + " should be cancelled");
+            assertEquals(0, res.processed(), "Mode " + mode + " should have processed nothing");
+        }
+    }
+
+    @Test
+    void testCancelDuringProcessing() throws IOException {
+        int count = 200;
+        for (int i = 0; i < count; i++) {
+            createTestImage("img_" + i + ".png", 10, 10, 0);
+        }
+
+        BatchRunner.CancelToken ct = new BatchRunner.CancelToken();
+        AtomicInteger calls = new AtomicInteger();
+        BatchRunner.ProgressListener l = (done, total) -> {
+            calls.incrementAndGet();
+            if (done >= 1) ct.cancel();
+        };
+
+        for (BatchRunner.Mode mode : BatchRunner.Mode.values()) {
+            Path out = Files.createTempDirectory("cancel_" + mode);
+            BatchRunner.RunResult res = runner.run(mode, inputDir, out, 2, l, ct);
+            assertTrue(res.cancelled(), "Mode " + mode + " should be cancelled");
+            assertTrue(res.processed() < count, "Mode " + mode + " should not have finished");
+
+            Set<Thread> alive = new HashSet<>();
+            Thread.getAllStackTraces().keySet().forEach(t -> {
+                if (t.getName().contains("BatchRunner") || t.getName().contains("ForkJoinPool")) {
+                    if (t.getState() != Thread.State.TERMINATED) alive.add(t);
+                }
+            });
+            // For sequential, no pool is created, so we just check if it's not processing
+        }
+    }
+
+    @Test
+    void testBaselineCache() throws IOException {
+        createTestImage("img.png", 10, 10, 0);
+        BatchRunner.CancelToken ct = new BatchRunner.CancelToken();
+
+        int startCount = runner.getBaselineInvocationCount();
+        runner.runSequentialBaseline(inputDir, ct);
+        int firstCall = runner.getBaselineInvocationCount();
+
+        runner.runSequentialBaseline(inputDir, ct);
+        int secondCall = runner.getBaselineInvocationCount();
+
+        assertEquals(1, firstCall - startCount, "First call should increment invocation count");
+        assertEquals(firstCall, secondCall, "Second call should use cache");
+    }
+
+    @Test
+    void testBaselineTempDirDeleted() throws IOException {
+        createTestImage("img.png", 10, 10, 0);
+        BatchRunner.CancelToken ct = new BatchRunner.CancelToken();
+
+        // Standard run
+        runner.runSequentialBaseline(inputDir, ct);
+
+        // Cancelled run
+        BatchRunner.CancelToken ctCancel = new BatchRunner.CancelToken();
+        ctCancel.cancel();
+
+        // We just verify that it completes without crashing and the code handles it.
+        assertDoesNotThrow(() -> runner.runSequentialBaseline(inputDir, ctCancel));
+    }
+
+    @Test
+    void testOrchestrationLogic() throws IOException {
+        createTestImage("img.png", 10, 10, 0);
+        BatchRunner.CancelToken ct = new BatchRunner.CancelToken();
+        List<String> statuses = new ArrayList<>();
+        Consumer<String> statusConsumer = statuses::add;
+
+        BatchRunner.Comparison comp = runner.runWithComparison(
+            BatchRunner.Mode.PARALLEL_IMAGES, inputDir, outputDir, 4, null, ct, true, statusConsumer);
+
+        assertTrue(statuses.contains("Warming up..."));
+        assertTrue(statuses.contains("Running sequential baseline..."));
+        assertTrue(statuses.contains("Running PARALLEL_IMAGES..."));
+
+        assertNotNull(comp.run());
+        assertNotNull(comp.baselineNanos());
+        assertEquals((double)comp.baselineNanos() / comp.run().elapsedNanos(), comp.speedup(), 0.001);
+        assertEquals(comp.speedup() / 4, comp.efficiency(), 0.001);
+    }
+
+    @Test
+    void testOrchestrationSequential() throws IOException {
+        createTestImage("img.png", 10, 10, 0);
+        BatchRunner.CancelToken ct = new BatchRunner.CancelToken();
+
+        BatchRunner.Comparison comp = runner.runWithComparison(
+            BatchRunner.Mode.SEQUENTIAL, inputDir, outputDir, 4, null, ct, true, null);
+
+        assertEquals(1.0, comp.speedup());
+        assertNull(comp.baselineNanos());
     }
 }

@@ -12,6 +12,7 @@ import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Consumer;
 import java.util.stream.Collectors;
 
 /**
@@ -19,6 +20,11 @@ import java.util.stream.Collectors;
  * It is designed to be called by a UI via a separate worker thread.
  */
 public class BatchRunner {
+
+    private static final int DEFAULT_ROWS_PER_STRIP = 64;
+    private static final AtomicBoolean warmedUp = new AtomicBoolean(false);
+    private static final Map<BaselineKey, Long> baselineCache = new ConcurrentHashMap<>();
+    private static final AtomicInteger baselineInvocations = new AtomicInteger(0);
 
     public enum Mode {
         SEQUENTIAL,
@@ -41,16 +47,25 @@ public class BatchRunner {
         int total,
         int processed,
         List<FailedFile> failedFiles,
+        List<String> warnings,
         boolean cancelled
     ) {}
 
     public record FailedFile(String fileName, String reason) {}
 
+    public record Comparison(
+        RunResult run,
+        Long baselineNanos,
+        double speedup,
+        double efficiency
+    ) {}
+
+    private record BaselineKey(String path, int count, long size) {}
+
     /**
      * Executes the batch process.
-     * For PARALLEL_IMAGES and PARALLEL_STRIPS, elapsedNanos covers the time from the start of
-     * the compute phase (pool creation/submission) until all images are processed and
-     * the pool is shut down (wall-clock time).
+     * elapsedNanos covers the total time the user waits inside run() after validation
+     * and file discovery, including pool creation and shutdown.
      */
     public RunResult run(Mode mode, Path inputDir, Path outputDir, int threads, ProgressListener l, CancelToken c) {
         if (!Files.exists(inputDir) || !Files.isDirectory(inputDir)) {
@@ -72,25 +87,26 @@ public class BatchRunner {
             throw new IllegalArgumentException("No valid images found in " + inputDir);
         }
 
+        long start = System.nanoTime();
         if (mode == Mode.SEQUENTIAL) {
-            return runSequential(files, outputDir, l, c);
+            return runSequential(files, outputDir, l, c, start);
         } else if (mode == Mode.PARALLEL_IMAGES) {
-            return runParallelImages(files, outputDir, threads, l, c);
+            return runParallelImages(files, outputDir, threads, l, c, start);
         } else {
-            return runParallelStrips(files, outputDir, threads, l, c);
+            return runParallelStrips(files, outputDir, threads, l, c, start);
         }
     }
 
-    private RunResult runSequential(List<Path> files, Path outputDir, ProgressListener l, CancelToken c) {
+    private RunResult runSequential(List<Path> files, Path outputDir, ProgressListener l, CancelToken c, long start) {
         List<FailedFile> failures = new ArrayList<>();
+        List<String> warnings = new ArrayList<>();
         int processed = 0;
-        long start = System.nanoTime();
 
         SequentialProcessor processor = new SequentialProcessor();
 
         for (Path file : files) {
             if (c != null && c.isCancelled()) {
-                return new RunResult(System.nanoTime() - start, files.size(), processed, failures, true);
+                return new RunResult(System.nanoTime() - start, files.size(), processed, failures, warnings, true);
             }
 
             try {
@@ -107,12 +123,13 @@ public class BatchRunner {
             }
         }
 
-        return new RunResult(System.nanoTime() - start, files.size(), processed, failures, false);
+        return new RunResult(System.nanoTime() - start, files.size(), processed, failures, warnings, false);
     }
 
-    private RunResult runParallelImages(List<Path> files, Path outputDir, int threads, ProgressListener l, CancelToken c) {
+    private RunResult runParallelImages(List<Path> files, Path outputDir, int threads, ProgressListener l, CancelToken c, long start) {
         int total = files.size();
         List<FailedFile> failures = Collections.synchronizedList(new ArrayList<>());
+        List<String> warnings = Collections.synchronizedList(new ArrayList<>());
         AtomicInteger processed = new AtomicInteger(0);
         AtomicInteger doneCount = new AtomicInteger(0);
         Semaphore memSemaphore = new Semaphore(threads);
@@ -124,7 +141,6 @@ public class BatchRunner {
         };
         ExecutorService executor = Executors.newFixedThreadPool(threads, factory);
 
-        long start = System.nanoTime();
         try {
             List<CompletableFuture<Void>> futures = new ArrayList<>();
             for (Path file : files) {
@@ -134,11 +150,15 @@ public class BatchRunner {
                     try {
                         memSemaphore.acquire();
                         try {
+                            if (c != null && c.isCancelled()) return;
                             ImageBuffer input = decode(file);
                             SequentialProcessor processor = new SequentialProcessor();
                             ImageBuffer output = processor.process(input);
                             write(output, file.getFileName().toString(), outputDir);
                             processed.incrementAndGet();
+                        } catch (IOException e) {
+                            try { Files.deleteIfExists(outputDir.resolve(file.getFileName().toString())); } catch (IOException ignore) {}
+                            throw e;
                         } finally {
                             memSemaphore.release();
                         }
@@ -152,11 +172,14 @@ public class BatchRunner {
                 }, executor));
             }
             CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).join();
+        } catch (CancellationException | CompletionException e) {
+            // Handle join failure on cancel
         } finally {
             executor.shutdown();
             try {
-                if (!executor.awaitTermination(60, TimeUnit.SECONDS)) {
+                if (!executor.awaitTermination(5, TimeUnit.SECONDS)) {
                     executor.shutdownNow();
+                    warnings.add("ParallelImage pool shutdown timed out");
                 }
             } catch (InterruptedException e) {
                 executor.shutdownNow();
@@ -164,29 +187,24 @@ public class BatchRunner {
             }
         }
 
-        long end = System.nanoTime();
-        return new RunResult(end - start, total, processed.get(), new ArrayList<>(failures), c != null && c.isCancelled());
+        return new RunResult(System.nanoTime() - start, total, processed.get(), new ArrayList<>(failures), new ArrayList<>(warnings), c != null && c.isCancelled());
     }
 
-    private RunResult runParallelStrips(List<Path> files, Path outputDir, int threads, ProgressListener l, CancelToken c) {
+    private RunResult runParallelStrips(List<Path> files, Path outputDir, int threads, ProgressListener l, CancelToken c, long start) {
         int total = files.size();
         List<FailedFile> failures = new ArrayList<>();
+        List<String> warnings = new ArrayList<>();
         int processed = 0;
 
-        // Fixed rowsPerStrip = 64 as per harness
-        int rowsPerStrip = 64;
-
-        // ForkJoinPool(N) created before timed region
         ForkJoinPool pool = new ForkJoinPool(threads);
 
-        long start = System.nanoTime();
         try {
-            ParallelStripProcessor psp = new ParallelStripProcessor(threads, rowsPerStrip);
+            ParallelStripProcessor psp = new ParallelStripProcessor(threads, DEFAULT_ROWS_PER_STRIP);
             psp.setPool(pool);
 
             for (Path file : files) {
                 if (c != null && c.isCancelled()) {
-                    return new RunResult(System.nanoTime() - start, total, processed, failures, true);
+                    return new RunResult(System.nanoTime() - start, total, processed, failures, warnings, true);
                 }
 
                 try {
@@ -205,11 +223,9 @@ public class BatchRunner {
         } finally {
             pool.shutdown();
             try {
-                if (!pool.awaitTermination(60, TimeUnit.SECONDS)) {
+                if (!pool.awaitTermination(5, TimeUnit.SECONDS)) {
                     pool.shutdownNow();
-                    // Report error as requested (via failure list or result flag, but RunResult doesn't have a general error field,
-                    // so we ensure it's not silent. Since we can't throw from finally, we mark a failure if it happened).
-                    failures.add(new FailedFile("System", "ParallelStrip pool shutdown timed out"));
+                    warnings.add("ParallelStrip pool shutdown timed out");
                 }
             } catch (InterruptedException e) {
                 pool.shutdownNow();
@@ -217,8 +233,106 @@ public class BatchRunner {
             }
         }
 
-        long end = System.nanoTime();
-        return new RunResult(end - start, total, processed, failures, false);
+        return new RunResult(System.nanoTime() - start, total, processed, failures, warnings, false);
+    }
+
+    // --- Step 5 Features ---
+
+    public void warmUp(Path inputDir) {
+        if (!warmedUp.compareAndSet(false, true)) return;
+        try {
+            List<Path> files = discoverImages(inputDir);
+            int limit = Math.min(2, files.size());
+            SequentialProcessor seq = new SequentialProcessor();
+            for (int i = 0; i < limit; i++) {
+                ImageBuffer buf = decode(files.get(i));
+                seq.process(buf);
+            }
+        } catch (IOException e) {
+            // Warmup errors are logged but not thrown
+        }
+    }
+
+    public void resetWarmUp() {
+        warmedUp.set(false);
+    }
+
+    public long runSequentialBaseline(Path inputDir, CancelToken c) throws IOException {
+        Path tempDir = Files.createTempDirectory("baseline_");
+        try {
+            List<Path> files = discoverImages(inputDir);
+
+            long totalSize = 0;
+            for (Path p : files) totalSize += Files.size(p);
+            BaselineKey key = new BaselineKey(inputDir.toRealPath().toString(), files.size(), totalSize);
+
+            if (baselineCache.containsKey(key)) {
+                return baselineCache.get(key);
+            }
+
+            baselineInvocations.incrementAndGet();
+            long start = System.nanoTime();
+            SequentialProcessor seq = new SequentialProcessor();
+            for (Path file : files) {
+                if (c != null && c.isCancelled()) throw new IOException("Cancelled");
+                ImageBuffer in = decode(file);
+                ImageBuffer out = seq.process(in);
+                write(out, file.getFileName().toString(), tempDir);
+            }
+            long elapsed = System.nanoTime() - start;
+            baselineCache.put(key, elapsed);
+            return elapsed;
+        } finally {
+            deleteDirectory(tempDir);
+        }
+    }
+
+    public Comparison runWithComparison(Mode mode, Path inputDir, Path outputDir, int threads, ProgressListener listener, CancelToken cancel, boolean compare, Consumer<String> status) {
+        if (status != null) status.accept("Warming up...");
+        warmUp(inputDir);
+
+        Long baselineNanos = null;
+        if (compare && mode != Mode.SEQUENTIAL) {
+            if (status != null) status.accept("Running sequential baseline...");
+            try {
+                baselineNanos = runSequentialBaseline(inputDir, cancel);
+            } catch (IOException e) {
+                // Baseline failure treated as non-comparable
+            }
+        }
+
+        if (status != null) status.accept("Running " + mode + "...");
+        RunResult run = run(mode, inputDir, outputDir, threads, listener, cancel);
+
+        return computeComparison(run, baselineNanos, threads, mode);
+    }
+
+    private Comparison computeComparison(RunResult run, Long baselineNanos, int threads, Mode mode) {
+        if (run.cancelled()) {
+            return new Comparison(run, baselineNanos, 0.0, 0.0);
+        }
+        if (mode == Mode.SEQUENTIAL) {
+            return new Comparison(run, null, 1.0, 1.0 / 1);
+        }
+        if (baselineNanos == null) {
+            return new Comparison(run, null, 0.0, 0.0);
+        }
+        double speedup = (double) baselineNanos / run.elapsedNanos();
+        double efficiency = speedup / threads;
+        return new Comparison(run, baselineNanos, speedup, efficiency);
+    }
+
+    public int getBaselineInvocationCount() {
+        return baselineInvocations.get();
+    }
+
+    private void deleteDirectory(Path path) {
+        try {
+            Files.walk(path)
+                .sorted(Comparator.reverseOrder())
+                .map(Path::toFile)
+                .forEach(File::delete);
+        } catch (IOException ignore) {}
     }
 
     private List<Path> discoverImages(Path dir) {
