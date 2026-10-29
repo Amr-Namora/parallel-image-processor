@@ -1,0 +1,174 @@
+# UI phase: prompts to send to Claude Code, one at a time
+
+Send the next step only after the previous one is confirmed (real output, tests green, I rebuilt in IntelliJ where needed). Commit to git after every accepted step.
+
+Common footer (already included in each prompt): real output only, "NOT RUN" for anything not run, stop at the first failure, no extra features, wait for my OK.
+
+---
+
+## STEP 1: Orientation (no code)
+
+```
+Read CLAUDE.md in the project root first, then inspect the real code and git state. Do NOT write or change any code in this step.
+Report:
+1. The classes I can reuse for the app, with exact signatures: SequentialProcessor, ParallelImageProcessor, ParallelStripProcessor, ImageBuffer, the decode and write functions used by the benchmark harness, and the filters.
+2. Where the verified pipelined logic lives (decode -> compute -> write per image, Semaphore with permits = N, released in finally). Can it be reused as is? If it must be extracted into a shared class, propose exactly how, without changing benchmark behavior, and say what we must re-verify (tests, smoke test).
+3. How many tests exist and whether they all pass now (run them only if you can; otherwise write NOT RUN).
+4. git status: uncommitted changes?
+5. Whether any BenchmarkHarness java process is running (PowerShell Get-CimInstance Win32_Process).
+6. Any inconsistency between CLAUDE.md and the code.
+Rules: real output only, NOT RUN for anything not run, no extra features. Stop after the report and wait for my OK.
+```
+
+Check before the next step: the reuse plan is simple, benchmark behavior stays untouched, tests pass, no harness process running.
+
+---
+
+## STEP 2: Pom cleanup + BatchRunner skeleton + Sequential mode
+
+```
+Step 2. Do only this:
+1. pom.xml: remove the org.openjfx dependencies and the javafx-maven-plugin (and any JavaFX leftovers in the code). Keep forkCount=0.
+2. Create a NON-UI class BatchRunner (package com.homework.processor.app, or tell me a better place) with this API shape:
+   - enum Mode { SEQUENTIAL, PARALLEL_IMAGES, PARALLEL_STRIPS } (only SEQUENTIAL is implemented in this step; the others throw a clear UnsupportedOperationException for now)
+   - interface ProgressListener { void onProgress(int done, int total); } (must be callable from any thread)
+   - class CancelToken (AtomicBoolean based, cancel() and isCancelled())
+   - record/class RunResult: elapsedNanos, total, processed, list of failed files (name + reason), cancelled flag
+   - RunResult run(Mode mode, Path inputDir, Path outputDir, int threads, ProgressListener l, CancelToken c)
+3. Image discovery: non-recursive, extensions png/jpg/jpeg (case-insensitive), sorted by file name. Validation: input folder must exist; output folder is created if missing; input equal to output is rejected with a clear exception message; no images found is reported with a clear exception message.
+4. SEQUENTIAL: for each image decode -> Gaussian -> Sobel -> write PNG (same base name) to the output folder, one at a time, reusing the existing decode/write functions and processors. A corrupt or unreadable image is recorded as failed (name + reason) and the run continues. Progress is reported after each image.
+5. Headless JUnit tests: sequential output read back from disk equals the existing SequentialProcessor result pixel by pixel (sizes 97x61 and one larger image); a corrupt .png in the folder is counted as failed and the rest are processed; empty folder; input equal to output rejected.
+Do not touch benchmark code. Show the class and method names, the real test output (counts), and what is NOT RUN. I will rebuild in IntelliJ when you ask me to.
+Rules: real output only, no extra features. Stop and wait for my OK.
+```
+
+Check before the next step: tests green with the new count, API shape as above, nothing changed in the benchmark package.
+
+---
+
+## STEP 3: Parallel Images mode
+
+```
+Step 3. Implement Mode.PARALLEL_IMAGES in BatchRunner, nothing else.
+- Fixed pool of exactly N threads, created before the timed region and shut down in finally (shutdown + awaitTermination, restore the interrupt flag on InterruptedException).
+- Each pool task does decode -> compute -> write for its own image. A Semaphore bounds the images in memory: permits = N, acquired BEFORE decoding, released in finally AFTER the write. Reuse the verified pipelined logic from Step 1's plan; do not duplicate algorithms.
+- Progress through an AtomicInteger and the ProgressListener (thread-safe). Failed files recorded in a thread-safe collection, with name and reason; an exception in one image never hangs or kills the batch.
+- Tests (headless): output pixel-identical to the sequential output for N = 1, 2, 4, 8 and for N greater than the number of images; repeat each configuration 20 times on small images (sizes not divisible by anything, e.g. 97x61); a test with permits = 1 (N = 1) finishes without deadlock; a batch with one corrupt file completes and reports it; after run() returns, no thread of the pool is still alive (name the pool threads so the test can check).
+Show the real test output with counts. If a test fails, show the first differing image and pixel position and stop.
+Rules: real output only, NOT RUN where applicable, no extra features. Stop and wait for my OK.
+```
+
+Check before the next step: all repetition tests pass, thread-leak test exists, no shared mutable state.
+
+---
+
+## STEP 4: Parallel Strips mode
+
+```
+Step 4. Implement Mode.PARALLEL_STRIPS in BatchRunner, nothing else.
+- Images are processed one after another: decode -> ParallelStripProcessor (rowsPerStrip = 64, same default as the harness) on ONE dedicated ForkJoinPool(N) created before the timed region and shut down in finally (not one pool per image) -> write.
+- Same result object, progress, failure handling as the other modes.
+- Tests: pixel-identical to sequential for N = 1, 2, 4, 8, with sizes 97x61, a very short image (height smaller than the strip size) and a larger one; repeated 20 times; corrupt file handled; no pool thread alive after run().
+Show the real test output with counts and the total test count of the project.
+Rules: real output only, NOT RUN where applicable, no extra features. Stop and wait for my OK.
+```
+
+Check before the next step: total test count increased and all green.
+
+---
+
+## STEP 5: Cancel, warm-up and sequential baseline
+
+```
+Step 5. Add to BatchRunner (non-UI), nothing else:
+1. Cancel: CancelToken is checked between images and by pool tasks before starting each image. On cancel: stop submitting work, shutdownNow, bounded wait for termination (about 5 s), run() returns a RunResult with cancelled = true and counts so far; no pool thread stays alive. Partial output of an image that was being written is deleted if it can be detected.
+2. Warm-up: a method that runs the sequential pipeline in memory (no write) on up to 2 images, executed once per JVM session before the first timed run; untimed, and the UI will show it in the status line.
+3. Baseline: method runSequentialBaseline(inputDir, ...) writing to a temporary folder (Files.createTempDirectory) deleted in finally, with the time cached per (canonical input path, image count, total file size) so changing N does not repeat it.
+4. Orchestration method that, when the baseline option is on, returns the selected run plus baseline time, speedup = T_seq / T_par and efficiency = speedup / N (for sequential mode: speedup 1.00).
+5. Tests: cancel during a multi-image run returns within a few seconds with cancelled = true and no leftover threads, in all three modes (use generated images large enough to be cancelled mid-run, or a test hook); the baseline cache is used on the second call (prove it with a counter, not with timing); the temp folder is deleted.
+Show the real test output with counts and the total.
+Rules: real output only, NOT RUN where applicable, no extra features. Stop and wait for my OK.
+```
+
+Check before the next step: cancel works in all three modes, no timing-based assertions, temp folders cleaned.
+
+---
+
+## STEP 6: Swing window (layout only, nothing wired to processing)
+
+```
+Step 6. Create the Swing window, with NO processing wired yet.
+- ImageProcessorUI (JFrame), system look and feel (UIManager.getSystemLookAndFeelClassName), started with SwingUtilities.invokeLater from a main method; resizable, with a sensible minimum size; layout that looks normal at 100% and 150% Windows scaling (use layout managers, no absolute positions).
+- Components: input folder (text field + Browse, JFileChooser directories only); output folder (same); mode combo (Sequential / Parallel Images / Parallel Strips); thread spinner 1..16, default = physical cores if the harness has a reusable helper for that (do not change it), otherwise max(1, logical/2), disabled for Sequential; label with the cores info; checkbox "Compare with sequential baseline" (default on); Start and Cancel buttons (only one enabled at a time); JProgressBar; status line; live clock label updated by a javax.swing.Timer that runs from startup; a results area (read-only labels or text area) for: elapsed time, sequential time, speedup, efficiency, processed, failed; and the note "Illustrative single run; report numbers come from the benchmark harness."
+- Start only validates the fields (folders filled in, input different from output) and shows a dialog "processing not wired yet".
+- Give me a manual test list for this step (what to click, what must happen). I will rebuild in IntelliJ and run the window myself.
+Rules: real output only, no extra features, no processing logic in the ui package. Stop and wait for my OK.
+```
+
+Check before the next step: I run the window on my machine, test the list, take notes on layout problems, tell Claude Code what to fix (small fixes only).
+
+---
+
+## STEP 7: ProcessorWorker and wiring
+
+```
+Step 7. Wire the window to BatchRunner through ProcessorWorker, nothing else.
+- ProcessorWorker extends SwingWorker<..., ...>: doInBackground calls BatchRunner (with the baseline orchestration when the checkbox is on) and publishes progress; done() calls get() and handles ExecutionException/CancellationException by showing the cause in a message; the Event Dispatch Thread never decodes, computes or writes. Progress comes through the thread-safe ProgressListener and is delivered to the EDT via publish/process.
+- UI states: idle / warm-up (status line "Warming up...") / running / cancelling. Start disabled while running; Cancel calls the CancelToken and the UI returns to idle when the run really ends.
+- Results area filled when the run ends: elapsed time, sequential time (if compared), speedup with 2 decimals, efficiency, processed and failed counts; failed files listed by name with the reason (dialog or text area).
+- Closing the window during a run cancels it, waits briefly for the worker, and the process exits.
+- Validation errors (empty input folder, input equal to output, no images) show a friendly message and nothing starts.
+- A small results table with one row per run of the session is allowed ONLY if it is a few lines of code; skip it otherwise.
+- Give me a manual test list. I will rebuild in IntelliJ and test by hand.
+Rules: real output only, no extra features. Stop and wait for my OK.
+```
+
+Check before the next step: window works end to end for all three modes on a small folder; errors shown as messages; no freezing.
+
+---
+
+## STEP 8: Acceptance testing (I run it, you fix)
+
+```
+Step 8. Do not change code yet. Prepare the acceptance run:
+1. Give me the exact command to generate 48 4K images into a folder using the existing DatasetGenerator (without changing benchmark behavior), and where it will put them.
+2. Give me, for each item below, the exact manual steps and what I must observe:
+   a. With 48 4K images, while processing the window can be dragged and resized, the live clock ticks and the progress bar moves.
+   b. All three modes finish with correct-looking output images; Parallel Images at N = 4 is clearly faster than Sequential.
+   c. Cancel returns to idle in about 1-2 s and leaves no temp files; check the thread count of the process afterwards in a way I can do on Windows.
+   d. A folder with a corrupt image file reports it and continues; an empty folder shows a message; input equal to output is rejected.
+   e. Closing the window during a run ends the process.
+3. Also tell me how to compare one UI output image with the benchmark/sequential output so I can confirm correctness myself.
+Wait for my findings; then fix only what I report.
+```
+
+Check before the next step: I report findings of each item; fixes are small and verified.
+
+---
+
+## STEP 9: Packaging and README
+
+```
+Step 9. Packaging for Windows 11 and documentation:
+1. A runnable JAR (maven-shade or assembly) containing the app, with the main class set; and run_app.cmd that starts it with `javaw -Xmx4G -jar "<path>"` (quote paths; make it work when double-clicked from the project folder).
+2. README.md: what the project is (3-4 lines), how to build (IntelliJ Build -> Rebuild Project, and Maven package from IntelliJ's Maven tool window because mvnw does not run in the Claude Code shell; mention forkCount=0 and why), how to run the app, how to run the tests, how to run the benchmark (run_benchmarks.cmd), project structure, and the limitation note that a single UI run is illustrative (disk cache, JIT).
+3. Verify what you can (the JAR exists, the manifest has the main class). Tell me exactly what I must click to confirm that the JAR starts on my machine; mark what is NOT RUN.
+Do NOT start jpackage; ask me first if you think it is worth it.
+Rules: real output only, no extra features. Stop and wait for my OK.
+```
+
+Check before the next step: I double-click run_app.cmd and the window opens and processes a folder.
+
+---
+
+## STEP 10: Wrap-up
+
+```
+Step 10. Wrap-up, no new features:
+1. Run all tests and give me the real totals (or NOT RUN with the reason).
+2. Update the Project Status section of CLAUDE.md: UI finished (Swing), what was verified, what remains (final experiment with the harness, charts, the report).
+3. List the files added or changed in the UI phase, and suggest a git commit message.
+4. List the screenshots I should take for the report (window idle, running with progress, result with speedup, a failed-file message).
+5. Do NOT start the final experiment.
+Rules: real output only. Stop and wait for my OK.
+```
