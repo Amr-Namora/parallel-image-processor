@@ -22,9 +22,16 @@ import java.util.stream.Collectors;
 public class BatchRunner {
 
     private static final int DEFAULT_ROWS_PER_STRIP = 64;
-    private static final AtomicBoolean warmedUp = new AtomicBoolean(false);
-    private static final Map<BaselineKey, Long> baselineCache = new ConcurrentHashMap<>();
-    private static final AtomicInteger baselineInvocations = new AtomicInteger(0);
+    private final AtomicBoolean warmedUp = new AtomicBoolean(false);
+    private final Map<BaselineKey, Long> baselineCache = new ConcurrentHashMap<>();
+    private final AtomicInteger baselineInvocations = new AtomicInteger(0);
+
+    interface TempDirFactory {
+        Path create() throws IOException;
+    }
+
+    volatile Path lastBaselineTempDir;
+    TempDirFactory tempDirFactory = () -> Files.createTempDirectory("baseline_");
 
     public enum Mode {
         SEQUENTIAL,
@@ -57,8 +64,17 @@ public class BatchRunner {
         RunResult run,
         Long baselineNanos,
         double speedup,
-        double efficiency
-    ) {}
+        double efficiency,
+        String baselineWarning
+    ) {
+        /**
+         * Speedup Semantics:
+         * - Sequential Mode: 1.0 (baseline is not run)
+         * - Cancelled Run: 0.0
+         * - Baseline Failed: NaN (baselineWarning contains the reason)
+         * - Compare = false (Parallel Mode): NaN (no baseline run, baselineNanos null, baselineWarning null)
+         */
+    }
 
     private record BaselineKey(String path, int count, long size) {}
 
@@ -134,9 +150,10 @@ public class BatchRunner {
         AtomicInteger doneCount = new AtomicInteger(0);
         Semaphore memSemaphore = new Semaphore(threads);
 
+        AtomicInteger imgThreadId = new AtomicInteger(0);
         ThreadFactory factory = r -> {
             Thread t = new Thread(r);
-            t.setName("BatchRunner-ParallelImage-Thread");
+            t.setName("BatchRunner-Images-" + imgThreadId.getAndIncrement());
             return t;
         };
         ExecutorService executor = Executors.newFixedThreadPool(threads, factory);
@@ -196,7 +213,21 @@ public class BatchRunner {
         List<String> warnings = new ArrayList<>();
         int processed = 0;
 
-        ForkJoinPool pool = new ForkJoinPool(threads);
+        AtomicInteger stripThreadId = new AtomicInteger(0);
+        ForkJoinPool pool = new ForkJoinPool(threads,
+            new ForkJoinPool.ForkJoinWorkerThreadFactory() {
+                @Override
+                public ForkJoinWorkerThread newThread(ForkJoinPool pool) {
+                    ForkJoinWorkerThread w = new ForkJoinWorkerThread(pool) {
+                        @Override
+                        protected void onStart() {
+                            super.onStart();
+                        }
+                    };
+                    w.setName("BatchRunner-Strips-" + stripThreadId.getAndIncrement());
+                    return w;
+                }
+            }, null, false);
 
         try {
             ParallelStripProcessor psp = new ParallelStripProcessor(threads, DEFAULT_ROWS_PER_STRIP);
@@ -258,7 +289,8 @@ public class BatchRunner {
     }
 
     public long runSequentialBaseline(Path inputDir, CancelToken c) throws IOException {
-        Path tempDir = Files.createTempDirectory("baseline_");
+        Path tempDir = tempDirFactory.create();
+        lastBaselineTempDir = tempDir;
         try {
             List<Path> files = discoverImages(inputDir);
 
@@ -292,34 +324,41 @@ public class BatchRunner {
         warmUp(inputDir);
 
         Long baselineNanos = null;
+        String baselineWarning = null;
         if (compare && mode != Mode.SEQUENTIAL) {
             if (status != null) status.accept("Running sequential baseline...");
             try {
                 baselineNanos = runSequentialBaseline(inputDir, cancel);
             } catch (IOException e) {
-                // Baseline failure treated as non-comparable
+                if (cancel != null && cancel.isCancelled()) {
+                    return new Comparison(
+                        new RunResult(0, 0, 0, Collections.emptyList(), Collections.emptyList(), true),
+                        null, 0.0, 0.0, null
+                    );
+                }
+                baselineWarning = "baseline failed: " + e.getMessage();
             }
         }
 
         if (status != null) status.accept("Running " + mode + "...");
         RunResult run = run(mode, inputDir, outputDir, threads, listener, cancel);
 
-        return computeComparison(run, baselineNanos, threads, mode);
+        return computeComparison(run, baselineNanos, threads, mode, baselineWarning);
     }
 
-    private Comparison computeComparison(RunResult run, Long baselineNanos, int threads, Mode mode) {
+    private Comparison computeComparison(RunResult run, Long baselineNanos, int threads, Mode mode, String baselineWarning) {
         if (run.cancelled()) {
-            return new Comparison(run, baselineNanos, 0.0, 0.0);
+            return new Comparison(run, baselineNanos, 0.0, 0.0, baselineWarning);
         }
         if (mode == Mode.SEQUENTIAL) {
-            return new Comparison(run, null, 1.0, 1.0 / 1);
+            return new Comparison(run, null, 1.0, 1.0 / 1, baselineWarning);
         }
         if (baselineNanos == null) {
-            return new Comparison(run, null, 0.0, 0.0);
+            return new Comparison(run, null, Double.NaN, Double.NaN, baselineWarning);
         }
         double speedup = (double) baselineNanos / run.elapsedNanos();
         double efficiency = speedup / threads;
-        return new Comparison(run, baselineNanos, speedup, efficiency);
+        return new Comparison(run, baselineNanos, speedup, efficiency, baselineWarning);
     }
 
     public int getBaselineInvocationCount() {
@@ -327,9 +366,8 @@ public class BatchRunner {
     }
 
     private void deleteDirectory(Path path) {
-        try {
-            Files.walk(path)
-                .sorted(Comparator.reverseOrder())
+        try (var stream = Files.walk(path)) {
+            stream.sorted(Comparator.reverseOrder())
                 .map(Path::toFile)
                 .forEach(File::delete);
         } catch (IOException ignore) {}

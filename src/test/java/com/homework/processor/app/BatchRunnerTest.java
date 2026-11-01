@@ -10,8 +10,10 @@ import org.junit.jupiter.params.provider.ValueSource;
 import java.io.*;
 import java.nio.file.*;
 import java.util.*;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Consumer;
+import java.util.stream.Collectors;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -19,7 +21,12 @@ class BatchRunnerTest {
     @TempDir Path inputDir;
     @TempDir Path outputDir;
 
-    private BatchRunner runner = new BatchRunner();
+    private BatchRunner runner;
+
+    @BeforeEach
+    void setUp() {
+        runner = new BatchRunner();
+    }
 
     private void createTestImage(String name, int w, int h, int color) throws IOException {
         java.awt.image.BufferedImage img = new java.awt.image.BufferedImage(w, h, java.awt.image.BufferedImage.TYPE_INT_RGB);
@@ -112,16 +119,12 @@ class BatchRunnerTest {
         createTestImage("img.png", 10, 10, 0);
         runner.run(BatchRunner.Mode.PARALLEL_STRIPS, inputDir, outputDir, 4, null, null);
 
-        Set<Thread> activePoolThreads = new HashSet<>();
-        Thread.getAllStackTraces().keySet().forEach(t -> {
-            if (t.getName().contains("ForkJoinPool-1-worker")) {
-                activePoolThreads.add(t);
-            }
-        });
+        Set<Thread> alive = Thread.getAllStackTraces().keySet().stream()
+            .filter(t -> t.getName().startsWith("BatchRunner-Images-") || t.getName().startsWith("BatchRunner-S trips-"))
+            .filter(Thread::isAlive)
+            .collect(Collectors.toSet());
 
-        assertTrue(activePoolThreads.isEmpty() ||
-                   activePoolThreads.stream().allMatch(t -> t.getState() == Thread.State.TERMINATED),
-                   "Pool threads still alive");
+        assertTrue(alive.isEmpty(), "Pool threads still alive: " + alive);
     }
 
     @Test
@@ -188,8 +191,6 @@ class BatchRunnerTest {
         );
     }
 
-    // --- Step 5 Tests ---
-
     @Test
     void testPreCancelledToken() throws IOException {
         createTestImage("img.png", 10, 10, 0);
@@ -210,26 +211,26 @@ class BatchRunnerTest {
             createTestImage("img_" + i + ".png", 10, 10, 0);
         }
 
-        BatchRunner.CancelToken ct = new BatchRunner.CancelToken();
-        AtomicInteger calls = new AtomicInteger();
-        BatchRunner.ProgressListener l = (done, total) -> {
-            calls.incrementAndGet();
-            if (done >= 1) ct.cancel();
-        };
-
         for (BatchRunner.Mode mode : BatchRunner.Mode.values()) {
             Path out = Files.createTempDirectory("cancel_" + mode);
+            BatchRunner.CancelToken ct = new BatchRunner.CancelToken();
+            AtomicInteger calls = new AtomicInteger();
+            BatchRunner.ProgressListener l = (done, total) -> {
+                calls.incrementAndGet();
+                if (done >= 1) ct.cancel();
+            };
             BatchRunner.RunResult res = runner.run(mode, inputDir, out, 2, l, ct);
             assertTrue(res.cancelled(), "Mode " + mode + " should be cancelled");
             assertTrue(res.processed() < count, "Mode " + mode + " should not have finished");
+            if (mode == BatchRunner.Mode.SEQUENTIAL) {
+                assertEquals(1, res.processed(), "Sequential should have processed exactly 1");
+            }
 
-            Set<Thread> alive = new HashSet<>();
-            Thread.getAllStackTraces().keySet().forEach(t -> {
-                if (t.getName().contains("BatchRunner") || t.getName().contains("ForkJoinPool")) {
-                    if (t.getState() != Thread.State.TERMINATED) alive.add(t);
-                }
-            });
-            // For sequential, no pool is created, so we just check if it's not processing
+            Set<Thread> alive = Thread.getAllStackTraces().keySet().stream()
+                .filter(t -> t.getName().startsWith("BatchRunner-Images-") || t.getName().startsWith("BatchRunner-S trips-"))
+                .filter(Thread::isAlive)
+                .collect(Collectors.toSet());
+            assertTrue(alive.isEmpty(), "Pool threads still alive for " + mode + ": " + alive);
         }
     }
 
@@ -250,19 +251,41 @@ class BatchRunnerTest {
     }
 
     @Test
-    void testBaselineTempDirDeleted() throws IOException {
+    void testBaselineCleanupNormal() throws IOException {
         createTestImage("img.png", 10, 10, 0);
         BatchRunner.CancelToken ct = new BatchRunner.CancelToken();
-
-        // Standard run
         runner.runSequentialBaseline(inputDir, ct);
+        assertNotNull(runner.lastBaselineTempDir);
+        assertFalse(Files.exists(runner.lastBaselineTempDir), "Temp dir should be deleted after normal run");
+    }
 
-        // Cancelled run
-        BatchRunner.CancelToken ctCancel = new BatchRunner.CancelToken();
-        ctCancel.cancel();
+    @Test
+    void testBaselineCleanupCancelled() throws IOException {
+        createTestImage("img.png", 10, 10, 0);
+        BatchRunner.CancelToken ct = new BatchRunner.CancelToken();
+        AtomicBoolean created = new AtomicBoolean(false);
+        Path[] createdPath = new Path[1];
 
-        // We just verify that it completes without crashing and the code handles it.
-        assertDoesNotThrow(() -> runner.runSequentialBaseline(inputDir, ctCancel));
+        runner.tempDirFactory = () -> {
+            Path p = Files.createTempDirectory("baseline_cancel_");
+            created.set(true);
+            createdPath[0] = p;
+            ct.cancel();
+            return p;
+        };
+
+        BatchRunner.Comparison comp = runner.runWithComparison(
+            BatchRunner.Mode.PARALLEL_IMAGES, inputDir, outputDir, 4, null, ct, true, null);
+
+        assertTrue(created.get(), "TempDirFactory should have been called");
+        assertEquals(createdPath[0], runner.lastBaselineTempDir);
+        assertFalse(Files.exists(runner.lastBaselineTempDir), "Temp dir should be deleted after cancellation");
+        assertTrue(comp.run().cancelled());
+        assertNull(comp.baselineNanos());
+        assertEquals(0.0, comp.speedup());
+        try (var stream = Files.list(outputDir)) {
+            assertEquals(0, stream.count(), "Output folder should be empty");
+        }
     }
 
     @Test
@@ -275,14 +298,17 @@ class BatchRunnerTest {
         BatchRunner.Comparison comp = runner.runWithComparison(
             BatchRunner.Mode.PARALLEL_IMAGES, inputDir, outputDir, 4, null, ct, true, statusConsumer);
 
-        assertTrue(statuses.contains("Warming up..."));
-        assertTrue(statuses.contains("Running sequential baseline..."));
-        assertTrue(statuses.contains("Running PARALLEL_IMAGES..."));
+        int idx1 = statuses.indexOf("Warming up...");
+        int idx2 = statuses.indexOf("Running sequential baseline...");
+        int idx3 = statuses.indexOf("Running PARALLEL_IMAGES...");
+        assertTrue(idx1 >= 0 && idx2 >= 0 && idx3 >= 0, "All status messages must be present");
+        assertTrue(idx1 < idx2 && idx2 < idx3, "Statuses should be in order");
 
+        assertEquals(1, runner.getBaselineInvocationCount());
         assertNotNull(comp.run());
         assertNotNull(comp.baselineNanos());
-        assertEquals((double)comp.baselineNanos() / comp.run().elapsedNanos(), comp.speedup(), 0.001);
-        assertEquals(comp.speedup() / 4, comp.efficiency(), 0.001);
+        assertEquals((double)comp.baselineNanos() / comp.run().elapsedNanos(), comp.speedup(), 1e-9);
+        assertEquals(comp.speedup() / 4, comp.efficiency(), 1e-9);
     }
 
     @Test
@@ -294,6 +320,57 @@ class BatchRunnerTest {
             BatchRunner.Mode.SEQUENTIAL, inputDir, outputDir, 4, null, ct, true, null);
 
         assertEquals(1.0, comp.speedup());
+        assertEquals(0, runner.getBaselineInvocationCount());
         assertNull(comp.baselineNanos());
+    }
+
+    @Test
+    void testOrchestrationBaselineFailure() throws IOException {
+        createTestImage("img.png", 10, 10, 0);
+        runner.tempDirFactory = () -> {
+            throw new IOException("disk full");
+        };
+
+        BatchRunner.Comparison comp = runner.runWithComparison(
+            BatchRunner.Mode.PARALLEL_IMAGES, inputDir, outputDir, 4, null, null, true, null);
+
+        assertEquals(1, comp.run().processed());
+        assertNull(comp.baselineNanos());
+        assertTrue(comp.baselineWarning().contains("disk full"));
+        assertTrue(Double.isNaN(comp.speedup()));
+        assertTrue(Double.isNaN(comp.efficiency()));
+    }
+
+    @Test
+    void testSpeedupSequential() throws IOException {
+        createTestImage("img.png", 10, 10, 0);
+        BatchRunner.CancelToken ct = new BatchRunner.CancelToken();
+        BatchRunner.Comparison comp = runner.runWithComparison(
+            BatchRunner.Mode.SEQUENTIAL, inputDir, outputDir, 4, null, ct, true, null);
+        assertEquals(1.0, comp.speedup());
+        assertEquals(0, runner.getBaselineInvocationCount());
+        assertNull(comp.baselineNanos());
+    }
+
+    @Test
+    void testSpeedupCancelled() throws IOException {
+        createTestImage("img.png", 10, 10, 0);
+        BatchRunner.CancelToken ct = new BatchRunner.CancelToken();
+        ct.cancel();
+        BatchRunner.Comparison comp = runner.runWithComparison(
+            BatchRunner.Mode.PARALLEL_IMAGES, inputDir, outputDir, 4, null, ct, true, null);
+        assertEquals(0.0, comp.speedup());
+    }
+
+    @Test
+    void testSpeedupNoCompare() throws IOException {
+        createTestImage("img.png", 10, 10, 0);
+        BatchRunner.CancelToken ct = new BatchRunner.CancelToken();
+        BatchRunner.Comparison comp = runner.runWithComparison(
+            BatchRunner.Mode.PARALLEL_IMAGES, inputDir, outputDir, 4, null, ct, false, null);
+        assertTrue(Double.isNaN(comp.speedup()));
+        assertNull(comp.baselineNanos());
+        assertNull(comp.baselineWarning());
+        assertEquals(0, runner.getBaselineInvocationCount());
     }
 }
