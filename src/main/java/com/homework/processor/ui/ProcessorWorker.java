@@ -63,18 +63,31 @@ public class ProcessorWorker extends SwingWorker<Comparison, ProcessorWorker.Pro
     protected void done() {
         try {
             Comparison result = get();
-            ui.showResults(result);
+            if (result != null) {
+                if (result.run().cancelled()) {
+                    ui.updateStatus("Cancelled");
+                } else {
+                    ui.updateStatus("Done");
+                }
+                ui.showResults(result);
+            } else {
+                ui.updateStatus("Cancelled");
+            }
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
+            ui.updateStatus("Cancelled");
             ui.showError("Process interrupted: " + e.getMessage());
         } catch (java.util.concurrent.ExecutionException e) {
             Throwable cause = e.getCause();
+            String errorMsg = (cause != null) ? cause.getMessage() : e.getMessage();
+            ui.updateStatus("Failed: " + errorMsg);
             if (cause instanceof IllegalArgumentException) {
-                ui.showError(cause.getMessage());
+                ui.showError(errorMsg);
             } else {
-                ui.showError("Execution error: " + (cause != null ? cause.getMessage() : e.getMessage()));
+                ui.showError("Execution error: " + errorMsg);
             }
         } catch (Exception e) {
+            ui.updateStatus("Failed: " + e.getMessage());
             ui.showError("Unexpected error: " + e.getMessage());
         } finally {
             ui.setUIState(false);
