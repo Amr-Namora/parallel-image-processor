@@ -13,21 +13,25 @@ A Batch Image Processor in Java 21 (Maven, IntelliJ). Pipeline: Gaussian Blur (3
 
 Grading: 30% thread safety and synchronization, 30% real speedup, 20% practical app with a UI that never freezes, 20% timing accuracy, graphs and report.
 
-## Status
-- DONE and FROZEN: co
-- re filters, the three processors, 45+ tests (pixel-identical to sequential, shared-instance concurrency test), BenchmarkHarness (one JVM per mode, golden checksums, unique temp dirs, process guard, CSV with header). FULL_PIPELINED exists for ParallelImage only and was verified (50/50 correct runs, smoke test OK).
-- Do NOT change benchmark behavior. If the UI needs code that currently lives inside BenchmarkHarness, ask me first; any extraction must keep all tests green and the smoke test unchanged.
-- Old `results_*.csv` files from the concurrent-runs period are invalid and live in `old_invalid_results/`.
+## Project Status (Verified by User)
+- **UI**: Finished and wired (ImageProcessorUI + ProcessorWorker + BatchRunner). Status line ends with "Done", "Cancelled", or "Failed: <cause>".
+- **Acceptance**: Verified with 48 4K images (3840x2160, seed 42).
+    - Window stays responsive. All modes finish.
+    - Parallel outputs are byte-identical (SHA256) to Sequential.
+    - Cancel returns to idle in ~1s; no stray baseline temp folders, 0-byte files, or BatchRunner threads remain.
+    -  empty folder shows a message; a corrupt file is reported in the failed list and the run continues; input == output is rejected.
+    - Output folder inside input folder is accepted.
+    - Closing window during run ends process immediately.
+- **Sample Performance**: Sequential 35s; Parallel Images (4 threads) 11.8s (speedup 3.0, efficiency 0.76); Parallel Strips (4 threads) 27.65s (speedup 1.3, efficiency 0.33).
+- **Packaging**: Runnable JAR `target\parallel-image-processor-1.0-SNAPSHOT.jar` (Java 17 release). `run_app.cmd` tested via double-click and paths with spaces. README.md written.
+- **Tests**: Last run in IntelliJ: 73 tests, 0 failures.
 
-## Current phase: Windows 11 desktop app (Swing)
-- Swing, JDK only (remove the org.openjfx dependency/plugin from the pom). System look and feel.
-- Small on purpose: one window, 3-4 classes. Thread logic stays outside the `ui` package; the UI only calls existing processors through a small non-UI service class.
-- Never freezes: all processing in a SwingWorker, a live clock label (javax.swing.Timer) proves it. Cancel must work.
-- The UI shows one illustrative run. The benchmark harness remains the source of all numbers in the report.
-
-## After the UI (not before my approval)
-1. Final experiment with the harness (machine left alone): 16 and 48 images, N = 1, 2, 4, 8, 16, 5 repetitions (10 for sequential), same `-Xmx6G` for every mode.
-2. Charts from the CSV files and the 4-6 page technical report (ask me which language).
+## Open Items
+1. `run_benchmarks.cmd` is a smoke script: runs `BenchmarkHarness` 3 times with identical arguments (25 images, -Xmx8G, --out results.csv), producing `results.csv_<timestamp>.csv`.
+2. `BenchmarkHarness` runs all implementations (Sequential, ParallelImage, ParallelStrip) inside ONE JVM per invocation; no option to select a single implementation.
+3. Strip mode in harness still uses `processFixed` (new ForkJoinPool per image).
+4. Final experiment, charts, and 4-6 page technical report are not done.
+5. Stray files in repo root: `crash_stderr.log`, `crash_test.csv_*.csv`, and four `sample_*.csv`.
 
 ## Environment
 Windows 11, Java 21, IntelliJ Community. 4 physical / 8 logical cores (i5-10300H), 15.84 GB RAM.
@@ -40,6 +44,3 @@ Windows 11, Java 21, IntelliJ Community. 4 physical / 8 logical cores (i5-10300H
 - No new features beyond what I ask. The project is already complex enough.
 - Correctness before speed. Never include a row with a failed correctness check in report data.
 - Concurrency rules: no mutable per-call state in shared processors or filters; one dedicated pool per run, created before the timer and shut down in `finally`; Semaphore always released in `finally`.
-
-## Open items
-- Before the final experiment: BenchmarkHarness strip mode still uses processFixed (a new ForkJoinPool per image). Decide with me whether to switch it to setPool+process (two call sites, then re-run tests and the smoke test) or to document it.
