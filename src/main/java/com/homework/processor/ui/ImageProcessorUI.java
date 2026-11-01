@@ -1,5 +1,11 @@
 package com.homework.processor.ui;
 
+import com.homework.processor.app.BatchRunner;
+import com.homework.processor.app.BatchRunner.Comparison;
+import com.homework.processor.app.BatchRunner.RunResult;
+import com.homework.processor.app.BatchRunner.CancelToken;
+import com.homework.processor.app.BatchRunner.FailedFile;
+
 import javax.swing.*;
 import java.awt.*;
 import java.awt.event.*;
@@ -10,6 +16,11 @@ import java.time.LocalTime;
 import java.time.format.DateTimeFormatter;
 
 public class ImageProcessorUI extends JFrame {
+    // BatchRunner instance kept for the life of the window
+    private final BatchRunner runner = new BatchRunner();
+    private ProcessorWorker currentWorker;
+    private CancelToken currentCancelToken;
+
     // Folders Panel
     private JTextField txtInputFolder;
     private JTextField txtOutputFolder;
@@ -27,7 +38,6 @@ public class ImageProcessorUI extends JFrame {
     private JLabel lblStatus;
     private JLabel lblClock;
     private Timer clockTimer;
-    private Timer demoTimer;
 
     // Results Panel
     private JLabel lblElapsed, lblSequential, lblSpeedup, lblEfficiency, lblProcessed, lblFailed;
@@ -35,7 +45,7 @@ public class ImageProcessorUI extends JFrame {
 
     public ImageProcessorUI() {
         setTitle("Image Processor");
-        setDefaultCloseOperation(JFrame.EXIT_ON_CLOSE);
+        setDefaultCloseOperation(JFrame.DO_NOTHING_ON_CLOSE);
         setMinimumSize(new Dimension(760, 560));
 
         setLayout(new BorderLayout());
@@ -54,11 +64,39 @@ public class ImageProcessorUI extends JFrame {
         initClock();
         pack();
 
-        // Enforce minimum size to prevent window from starting too small
         Dimension size = getSize();
         setSize(Math.max(size.width, 760), Math.max(size.height, 560));
-
         setLocationRelativeTo(null);
+
+        setupCloseHandler();
+    }
+
+    private void setupCloseHandler() {
+        addWindowListener(new WindowAdapter() {
+            @Override
+            public void windowClosing(WindowEvent e) {
+                if (currentWorker != null && !currentWorker.isDone()) {
+                    if (currentCancelToken != null) {
+                        currentCancelToken.cancel();
+                    }
+                    setVisible(false);
+
+                    // Wait for worker in a daemon thread to avoid blocking EDT
+                    Thread exitThread = new Thread(() -> {
+                        try {
+                            currentWorker.get(3, java.util.concurrent.TimeUnit.SECONDS);
+                        } catch (Exception ignore) {
+                        }
+                        System.exit(0);
+                    });
+                    exitThread.setDaemon(true);
+                    exitThread.start();
+                } else {
+                    dispose();
+                    System.exit(0);
+                }
+            }
+        });
     }
 
     private JPanel createTitledPanel(String title, JPanel content) {
@@ -122,7 +160,7 @@ public class ImageProcessorUI extends JFrame {
         int cores = Runtime.getRuntime().availableProcessors();
         spinnerThreads = new JSpinner(new SpinnerNumberModel(Math.max(1, cores / 2), 1, 16, 1));
         gbc.gridx = 1;
-        gbc.weightx = 0; // Prevent spinner from stretching
+        gbc.weightx = 0;
         p.add(spinnerThreads, gbc);
 
         lblCores = new JLabel(cores + " logical cores detected");
@@ -132,7 +170,7 @@ public class ImageProcessorUI extends JFrame {
         checkCompare = new JCheckBox("Compare with sequential baseline");
         checkCompare.setSelected(true);
         gbc.gridx = 1; gbc.gridy = 2;
-        gbc.weightx = 1.0; // Restore weightx for checkbox
+        gbc.weightx = 1.0;
         p.add(checkCompare, gbc);
 
         updateSettingsEnablement();
@@ -231,36 +269,50 @@ public class ImageProcessorUI extends JFrame {
         clockTimer.start();
     }
 
+    public void updateStatus(String status) {
+        lblStatus.setText(status);
+    }
+
+    public void updateProgress(int done, int total) {
+        progressBar.setValue((int)(( (double)done / total) * 100));
+        progressBar.setString(done + " / " + total);
+    }
+
+    public void resetProgress() {
+        progressBar.setValue(0);
+        progressBar.setString("0 / 0");
+    }
+
     private void handleStart() {
         if (!validateInputs()) return;
 
-        // TEMP (remove in Step 7)
+        resetResults();
         setUIState(true);
-        lblStatus.setText("Processing...");
 
-        demoTimer = new Timer(50, new ActionListener() {
-            int progress = 0;
-            @Override
-            public void actionPerformed(ActionEvent e) {
-                progress += 1;
-                progressBar.setValue(progress);
-                progressBar.setString("Processing " + progress + " / 100");
-                if (progress >= 100) {
-                    demoTimer.stop();
-                    lblStatus.setText("Done");
-                    setUIState(false);
-                }
-            }
-        });
-        demoTimer.start();
+        BatchRunner.Mode mode = BatchRunner.Mode.valueOf(
+            comboMode.getSelectedItem().toString().toUpperCase().replace(" ", "_")
+        );
+
+        currentCancelToken = new CancelToken();
+        currentWorker = new ProcessorWorker(
+            this, runner, mode,
+            Paths.get(txtInputFolder.getText().trim()),
+            Paths.get(txtOutputFolder.getText().trim()),
+            (Integer) spinnerThreads.getValue(),
+            checkCompare.isSelected(),
+            currentCancelToken
+        );
+
+        currentWorker.execute();
     }
 
     private void handleCancel() {
-        if (demoTimer != null) {
-            demoTimer.stop();
+        if (currentCancelToken != null) {
+            currentCancelToken.cancel();
         }
-        lblStatus.setText("Cancelled");
-        setUIState(false);
+        lblStatus.setText("Cancelling...");
+        btnStart.setEnabled(false);
+        btnCancel.setEnabled(false);
     }
 
     private boolean validateInputs() {
@@ -301,11 +353,57 @@ public class ImageProcessorUI extends JFrame {
         return true;
     }
 
-    private void showError(String msg) {
-        JOptionPane.showMessageDialog(this, msg, "Validation Error", JOptionPane.ERROR_MESSAGE);
+    public void showResults(Comparison comp) {
+        RunResult run = comp.run();
+
+        if (run.cancelled()) {
+            lblElapsed.setText("-");
+            lblSequential.setText("-");
+            lblSpeedup.setText("-");
+            lblEfficiency.setText("-");
+            lblProcessed.setText("-");
+            lblFailed.setText("-");
+            txtLogs.append("Run was cancelled.\n");
+        } else {
+            lblElapsed.setText(String.format("%.2f s", run.elapsedNanos() / 1_000_000_000.0));
+            lblSequential.setText(comp.baselineNanos() == null ? "-" : String.format("%.2f s", comp.baselineNanos() / 1_000_000_000.0));
+
+            double s = comp.speedup();
+            lblSpeedup.setText(Double.isNaN(s) ? "-" : String.format("%.2f", s));
+
+            double e = comp.efficiency();
+            lblEfficiency.setText(Double.isNaN(e) ? "-" : String.format("%.2f", e));
+
+            lblProcessed.setText(String.valueOf(run.processed()));
+            lblFailed.setText(String.valueOf(run.failedFiles().size()));
+
+            if (comp.baselineWarning() != null) {
+                txtLogs.append("Baseline Warning: " + comp.baselineWarning() + "\n");
+            }
+            for (String w : run.warnings()) {
+                txtLogs.append("Warning: " + w + "\n");
+            }
+            for (FailedFile ff : run.failedFiles()) {
+                txtLogs.append(ff.fileName() + ": " + ff.reason() + "\n");
+            }
+        }
     }
 
-    private void setUIState(boolean running) {
+    private void resetResults() {
+        lblElapsed.setText("-");
+        lblSequential.setText("-");
+        lblSpeedup.setText("-");
+        lblEfficiency.setText("-");
+        lblProcessed.setText("-");
+        lblFailed.setText("-");
+        txtLogs.setText("");
+    }
+
+    public void showError(String msg) {
+        JOptionPane.showMessageDialog(this, msg, "Error", JOptionPane.ERROR_MESSAGE);
+    }
+
+    public void setUIState(boolean running) {
         btnStart.setEnabled(!running);
         btnCancel.setEnabled(running);
         txtInputFolder.setEnabled(!running);
