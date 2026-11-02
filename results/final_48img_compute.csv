@@ -1,0 +1,54 @@
+CPU: Intel(R) Core(TM) i5-10300H CPU @ 2.50GHz
+Physical Cores: 4
+Logical Cores: 8
+OS: Windows 11
+Java: 21.0.9
+Xmx: 6144MB
+Images: 48
+Measurement Type: COMPUTE_ONLY
+Mode,ThreadCount,RowsPerStrip,Rep,Round,Time_ms,GC_ms,BufferChecksumOK,DiskReadbackOK,Sum_Decode_ms,Sum_Compute_ms,Sum_Write_ms,Max_Dec,Max_Write
+Sequential,1,64,1,0,13527.866,243.000,true,true,0.000,13527.866,0.000,0,0
+Sequential,1,64,0,0,13394.752,247.000,true,true,0.000,13394.752,0.000,0,0
+Sequential,1,64,2,0,13480.203,227.000,true,true,0.000,13480.203,0.000,0,0
+ParallelImage,1,64,1,0,13394.002,278.000,true,true,0.000,13394.002,0.000,0,0
+ParallelImage,1,64,0,0,13337.709,27.000,true,true,0.000,13337.709,0.000,0,0
+ParallelImage,1,64,2,0,13619.788,45.000,true,true,0.000,13619.788,0.000,0,0
+ParallelStrip,1,64,1,0,14174.543,24.000,true,true,0.000,14174.543,0.000,0,0
+ParallelStrip,1,64,0,0,14266.181,235.000,true,true,0.000,14266.181,0.000,0,0
+ParallelStrip,1,64,2,0,13877.747,135.000,true,true,0.000,13877.747,0.000,0,0
+Sequential,1,64,1,0,13698.476,239.000,true,true,0.000,13698.476,0.000,0,0
+Sequential,1,64,0,0,13001.894,19.000,true,true,0.000,13001.894,0.000,0,0
+Sequential,1,64,2,0,13028.006,5.000,true,true,0.000,13028.006,0.000,0,0
+ParallelImage,2,64,1,0,7267.331,40.000,true,true,0.000,7267.331,0.000,0,0
+ParallelImage,2,64,0,0,7553.790,239.000,true,true,0.000,7553.790,0.000,0,0
+ParallelImage,2,64,2,0,7991.146,27.000,true,true,0.000,7991.146,0.000,0,0
+ParallelStrip,2,64,1,0,8118.232,85.000,true,true,0.000,8118.232,0.000,0,0
+ParallelStrip,2,64,0,0,8327.310,274.000,true,true,0.000,8327.310,0.000,0,0
+ParallelStrip,2,64,2,0,8740.115,246.000,true,true,0.000,8740.115,0.000,0,0
+Sequential,1,64,1,0,14166.034,233.000,true,true,0.000,14166.034,0.000,0,0
+Sequential,1,64,0,0,13641.397,219.000,true,true,0.000,13641.397,0.000,0,0
+Sequential,1,64,2,0,13068.359,25.000,true,true,0.000,13068.359,0.000,0,0
+ParallelImage,4,64,1,0,4533.814,34.000,true,true,0.000,4533.814,0.000,0,0
+ParallelImage,4,64,0,0,5232.995,18.000,true,true,0.000,5232.995,0.000,0,0
+ParallelImage,4,64,2,0,4593.637,33.000,true,true,0.000,4593.637,0.000,0,0
+ParallelStrip,4,64,1,0,5129.697,238.000,true,true,0.000,5129.697,0.000,0,0
+ParallelStrip,4,64,0,0,5068.540,224.000,true,true,0.000,5068.540,0.000,0,0
+ParallelStrip,4,64,2,0,4953.820,40.000,true,true,0.000,4953.820,0.000,0,0
+Sequential,1,64,1,0,12476.824,6.000,true,true,0.000,12476.824,0.000,0,0
+Sequential,1,64,0,0,13316.638,251.000,true,true,0.000,13316.638,0.000,0,0
+Sequential,1,64,2,0,13325.936,20.000,true,true,0.000,13325.936,0.000,0,0
+ParallelImage,8,64,1,0,3623.796,130.000,true,true,0.000,3623.796,0.000,0,0
+ParallelImage,8,64,0,0,3422.938,118.000,true,true,0.000,3422.938,0.000,0,0
+ParallelImage,8,64,2,0,3532.021,112.000,true,true,0.000,3532.021,0.000,0,0
+ParallelStrip,8,64,1,0,4522.383,200.000,true,true,0.000,4522.383,0.000,0,0
+ParallelStrip,8,64,0,0,4039.424,45.000,true,true,0.000,4039.424,0.000,0,0
+ParallelStrip,8,64,2,0,3944.799,65.000,true,true,0.000,3944.799,0.000,0,0
+Sequential,1,64,1,0,13254.949,270.000,true,true,0.000,13254.949,0.000,0,0
+Sequential,1,64,0,0,13226.141,231.000,true,true,0.000,13226.141,0.000,0,0
+Sequential,1,64,2,0,12576.361,21.000,true,true,0.000,12576.361,0.000,0,0
+ParallelImage,16,64,1,0,3002.879,6.000,true,true,0.000,3002.879,0.000,0,0
+ParallelImage,16,64,0,0,3015.046,7.000,true,true,0.000,3015.046,0.000,0,0
+ParallelImage,16,64,2,0,3340.865,66.000,true,true,0.000,3340.865,0.000,0,0
+ParallelStrip,16,64,1,0,3813.839,74.000,true,true,0.000,3813.839,0.000,0,0
+ParallelStrip,16,64,0,0,3870.578,56.000,true,true,0.000,3870.578,0.000,0,0
+ParallelStrip,16,64,2,0,3865.213,64.000,true,true,0.000,3865.213,0.000,0,0
